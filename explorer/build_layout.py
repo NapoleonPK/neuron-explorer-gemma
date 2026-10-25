@@ -1,5 +1,5 @@
-"""Seriated sheet layouts: places each layer's neurons on its grid (ceil(sqrt(N)) cells wide: 102 for Gemma 3 4B's
-10240 neurons) so that neurons with similar weights sit together. Embeds each neuron by its write column ("writes": the
+"""Seriated sheet layouts: places each layer's neurons on its grid (ceil(sqrt(N)) cells wide: 102 for the 10240
+neurons of Gemma 4 E4B and Gemma 3 4B) so that neurons with similar weights sit together. Embeds each neuron by its write column ("writes": the
 direction it adds to the residual stream) or its gate and up rows ("reads"), cosine-normalised, PCA to 50 dims, UMAP to
 2D, then snaps to the grid: sort by y into rows of the grid's width, then by x within each row.
 

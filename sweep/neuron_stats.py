@@ -1,4 +1,4 @@
-"""Per-neuron activation ranges for MLP layers of Gemma 3, plus their down-projection and write columns.
+"""Per-neuron activation ranges for MLP layers of Gemma (4 or 3), plus their down-projection and write columns.
 
 A neuron's activation is gelu(gate) * up, the input to down_proj. Positive activations come from two sign regimes
 (gate>0, up>0) and (gate<0, up<0); negative ones from (gate>0, up<0) and (gate<0, up>0). This records the extreme of
@@ -6,15 +6,16 @@ each regime per neuron over a mixed web + chat corpus, and saves every neuron's 
 the post-feedforward norm, see model_spec.py), which is the direction a steering push on neuron n adds to the residual
 stream.
 
-    uv run python sweep/neuron_stats.py --layers 17 --tokens 2000000 --out stats/g3-4b
+    uv run python sweep/neuron_stats.py --layers 17 --tokens 2000000
 
-Writes stats/g3-4b_L17.npz with
+Writes stats/gemma-4-e4b_L17.npz (the prefix follows the model) with
     pp_max, nn_max   largest positive activation in the (+,+) and (-,-) regimes          [I]
     pn_min, np_min   most negative activation in the (gate+, up-) and (gate-, up+) regimes [I]
     abs_max          max |activation| over everything (the unit for steering doses)      [I]
     w_down           down_proj columns, one row per neuron                                [I, H] float16
     w_write          write columns, one row per neuron (what steering pushes along)        [I, H] float16
     resid_norm_q10_50_90   quantiles of the per-token residual norm leaving the layer (scale for push sizes)
+    layer_scalar     the factor Gemma 4 multiplies the layer's whole output by (1 on Gemma 3)
 """
 import argparse
 import itertools
@@ -26,7 +27,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from model_spec import MODEL, TAG, load, write_cols
+from model_spec import MODEL, TAG, layer_scalar, load, write_cols
 
 
 def text_stream(tok, seed):
@@ -118,7 +119,7 @@ def main():
         resid_q = np.quantile(torch.cat(s.resid_norms).numpy(), [0.1, 0.5, 0.9])
         path = f"{a.out}_L{l}.npz"
         np.savez(path, pp_max=pp, nn_max=nn, pn_min=pn, np_min=np_, abs_max=abs_max, w_down=w_down, w_write=w_write,
-                 resid_norm_q10_50_90=resid_q, model=a.model, layer=l, tokens=n_steps * a.seq_len * a.batch)
+                 resid_norm_q10_50_90=resid_q, layer_scalar=layer_scalar(lm.layers[l]), model=a.model, layer=l, tokens=n_steps * a.seq_len * a.batch)
         print(f"L{l}: residual norm leaving the layer p10/p50/p90 = {resid_q.round(1)}")
         dn_top = (nn > pp).mean()
         print(f"L{l}: abs_max median {np.median(abs_max):.3f} [{abs_max.min():.3f}, {abs_max.max():.3f}]; "

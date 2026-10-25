@@ -1,9 +1,9 @@
 """Direct-path connections for every neuron in every layer, for the explorer's details tab.
 
-For layers i < j, P[B, A] = (W_gate_j[B] . v_A) * (W_up_j[B] . v_A) with v_A = (1 + w_j) * c_A, c_A neuron A's write
-column (sweep/model_spec.py) and w_j the pre-MLP norm weight of layer j. Neuron A's downstream links in layer j are
-column A of P, |P| z-scored over B; neuron B's upstream links in layer i are row B of P, |P| z-scored over A. Each neuron keeps its k strongest links per side
-across all layers, with sign(P).
+For layers i < j, P[B, A] = (W_gate_j[B] . v_A) * (W_up_j[B] . v_A) with v_A = s_j * c_A, c_A neuron A's write column
+and s_j the scale of layer j's pre-MLP norm (sweep/model_spec.py). Neuron A's downstream links in layer j are column A
+of P, |P| z-scored over B; neuron B's upstream links in layer i are row B of P, |P| z-scored over A. Each neuron keeps
+its k strongest links per side across all layers, with sign(P).
 
     uv run python explorer/build_connections.py            # CUDA, about 5 min on a 4090
 
@@ -34,7 +34,7 @@ bf = lambda t: t.to(dev, torch.bfloat16)
 down = [bf(ck.write_cols(l)) for l in range(L)]  # write columns, [hidden, N]
 gate = [bf(ck.tensor(l, "mlp.gate_proj.weight")) for l in range(L)]
 up = [bf(ck.tensor(l, "mlp.up_proj.weight")) for l in range(L)]
-norm = [bf(1.0 + ck.tensor(l, "pre_feedforward_layernorm.weight").float()) for l in range(L)]
+norm = [bf(ck.norm_scale(l, "pre_feedforward_layernorm")) for l in range(L)]
 
 # running top-k per neuron and side: score, source layer, source neuron, sign
 best = {s: (torch.full((L, N, K), -1e9, device=dev), torch.zeros((L, N, K), dtype=torch.int16, device=dev),

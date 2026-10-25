@@ -6,7 +6,7 @@ Keeps, per neuron and sign, the 12 tokens whose log-probability rises most (aver
 divergence from the unsteered prediction.
 
     uv run python sweep/steer_lens.py --layers 0-7 --out stats/steer_lens
-    uv run python sweep/steer_lens.py --layers 0-33 --out stats/steer_lens   # all of Gemma 3 4B
+    uv run python sweep/steer_lens.py --layers 0-41 --out stats/steer_lens   # all of Gemma 4 E4B
 
 Writes stats/steer_lens_L{l}.npz per layer: up_tok[N, 12], down_tok[N, 12] (token ids for the + push and - push),
 up_kl[N], down_kl[N].
@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
-from model_spec import MODEL, chat_ids, load, write_cols
+from model_spec import MODEL, chat_ids, layer_scalar, load, text_ids, write_cols
 
 CHAT = ["Who are you?", "Write whatever you like."]
 PLAIN = ["I think the most important thing to remember is", "Today we are going to talk about"]
@@ -28,7 +28,7 @@ PLAIN = ["I think the most important thing to remember is", "Today we are going 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--layers", default="0-33")
+    ap.add_argument("--layers", default="0-41", help="Gemma 4 E4B has 42 layers, Gemma 3 4B 34")
     ap.add_argument("--dose", type=float, default=0.8)
     ap.add_argument("--neurons-per-batch", type=int, default=96)
     ap.add_argument("--k", type=int, default=12)
@@ -41,7 +41,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     dev = a.device
     model, lm = load(a.model, dev)
-    ctxs = [chat_ids(tok, [{"role": "user", "content": c}]) for c in CHAT] + [tok(p).input_ids for p in PLAIN]
+    ctxs = [chat_ids(tok, [{"role": "user", "content": c}]) for c in CHAT] + [text_ids(tok, p) for p in PLAIN]
     C, T = len(ctxs), max(map(len, ctxs))
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
     ids = torch.tensor([[pad] * (T - len(c)) + c for c in ctxs], device=dev)
@@ -85,7 +85,7 @@ def main():
             for sign, key in ((1.0, "up"), (-1.0, "down")):
                 # rows: neuron-major, contexts repeated
                 cols = n.repeat_interleave(C)
-                push.update(layer=l, vecs=sign * a.dose * norms[l] * U[cols])
+                push.update(layer=l, vecs=sign * a.dose * norms[l] / layer_scalar(lm.layers[l]) * U[cols])
                 with torch.inference_mode():
                     lp = last_logprobs(ids.repeat(b, 1), mask.repeat(b, 1), posn.repeat(b, 1)).view(b, C, -1)
                 push["layer"] = None

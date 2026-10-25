@@ -1,7 +1,7 @@
 """Joins sharded sweep runs of one layer into a single run, one row per (kind, neuron, prompt, dose).
 
-    uv run python sweep/merge_runs.py runs/g3-4b-L22.jsonl runs/g3-4b-L22-s1.jsonl runs/g3-4b-L22-s2.jsonl \
-        runs/g3-4b-L22-s3.jsonl --out runs/g3-4b-L22-full.jsonl
+    uv run python sweep/merge_runs.py runs/gemma-4-e4b-L22.jsonl runs/gemma-4-e4b-L22-s1.jsonl runs/gemma-4-e4b-L22-s2.jsonl \
+        runs/gemma-4-e4b-L22-s3.jsonl --out runs/gemma-4-e4b-L22-full.jsonl
 
 The merged run's meta.json is the first input's, with the shard list recorded under "shards".
 """

@@ -2,12 +2,12 @@
 
 1. Steering: the fork adding v * c_n (neuron n's write column, model_spec.py) at mlp_out gives the same greedy
    rollout as HF adding it to the output of post_feedforward_layernorm, with v = dose x median residual norm / |c_n|
-   (the sweep's --dose-unit rel). HF and vLLM kernels differ in bf16 rounding, so the reference is how well an
+   (the sweep's --dose-unit rel; divided by Gemma 4's layer output scalar). HF and vLLM kernels differ in bf16 rounding, so the reference is how well an
    unsteered rollout agrees across the two engines; steered agreement should look the same.
 2. Capture: neuron activations recomputed from a captured mlp_in, gelu(W_gate x) * (W_up x), match HF's activations
    at the same tokens (all prompt positions; capture positions must exist when a request is admitted).
 
-    uv run python sweep/check_equivalence.py --stats stats/g3-4b_L17.npz --neurons 2742,17,5000
+    uv run python sweep/check_equivalence.py --stats stats/gemma-4-e4b_L17.npz --neurons 2742,17,5000
 """
 import argparse
 import os
@@ -47,7 +47,8 @@ def main():
     st = np.load(a.stats)
     layer, w_write = int(st["layer"]), st["w_write"].astype(np.float32)
     resid_p50 = float(st["resid_norm_q10_50_90"][1])
-    scale = lambda n, d: float(d * resid_p50 / np.linalg.norm(w_write[n]))
+    scalar = float(st["layer_scalar"]) if "layer_scalar" in st.files else 1.0
+    scale = lambda n, d: float(d * resid_p50 / (np.linalg.norm(w_write[n]) * scalar))
     neurons = [int(x) for x in a.neurons.split(",")]
     doses = [float(x) for x in a.doses.split(",")]
     tok = AutoTokenizer.from_pretrained(a.model)

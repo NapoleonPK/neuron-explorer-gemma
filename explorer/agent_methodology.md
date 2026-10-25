@@ -3,7 +3,7 @@
 A working method for explaining a single MLP neuron, built from hands-on investigation in the explorer.
 
 The worked examples below (`L20 N7531` and the others) come from the original Qwen3.5-4B explorer this one is ported
-from. Neuron ids do not carry over to Gemma 3 4B: read them as illustrations of patterns, never as neurons to look up
+from. Neuron ids do not carry over to Gemma: read them as illustrations of patterns, never as neurons to look up
 here. It complements the explorer prompt above and uses its vocabulary (poles, steer lens, cone, web summary).
 
 ## Mindset
@@ -57,4 +57,4 @@ here. It complements the explorer prompt above and uses its vocabulary (poles, s
 
 ## Reference neurons
 
-None yet for Gemma 3 4B. Add neurons here once they are understood, in the form `L<layer> N<n>±: what it does`.
+None yet for Gemma. Add neurons here once they are understood, in the form `L<layer> N<n>±: what it does`.

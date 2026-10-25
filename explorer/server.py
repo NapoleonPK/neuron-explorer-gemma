@@ -21,13 +21,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import MODEL, NO_MODEL, Runtime  # noqa: E402
+from runtime import MODEL, NO_MODEL, Runtime, text_ids  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 NAMES = os.path.join(ROOT, "explorer", "names.json")
 PORT = int(os.environ.get("PORT", 8791))
 _cfg = AutoConfig.from_pretrained(MODEL).get_text_config()
-# Gemma 3: every layer is softmax attention, five sliding-window layers to each global ("full_attention") one
+# Gemma 3 and 4: every layer is softmax attention, five sliding-window layers to each global ("full_attention") one
 ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
         "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
         "kv_heads": _cfg.num_key_value_heads, "sliding_window": _cfg.sliding_window}
@@ -338,7 +338,7 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
     if not os.path.exists(ACT_SCALE):
         return {"ready": False, "results": []}
     sc = np.load(ACT_SCALE)
-    ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
+    ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: text_ids(rt.tok, t)), text)
     acts = await asyncio.to_thread(rt.all_activations, ids)
     toks = [rt.tok.decode([t]) for t in ids]
     cand = []
@@ -365,7 +365,7 @@ _infer = {}
 async def score_text(text, chat=False):
     """Every neuron's activation at every token of `text` ([L, T, N]) and its signed score: the positive side as a
     multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz)."""
-    ids = rt.chat_ids(text) if chat else rt.tok(text).input_ids
+    ids = rt.chat_ids(text) if chat else text_ids(rt.tok, text)
     ids = ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.full_activations, ids)  # [L, T, N]
     sc = np.load(ACT_SCALE)
@@ -453,7 +453,7 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     active = {(int(i // N), int(i % N)) for i in cand}
     ci = rt.con_index()
     rows = []
-    for l, n in active:
+    for l, n in active if ci is not None else ():
         for i in range(ci["k"]):
             z = float(ci["down_z"][l, n, i])
             if z < -1e4:
@@ -485,6 +485,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
     out = []
+    if ci is None:  # no explorer/cache/connections.npz yet (build_connections.py)
+        return out
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
         front, seen, hop, start = [(layer, n)], {(layer, n)}, 1, len(out)
@@ -643,7 +645,8 @@ def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
     for _, (_, hop) in best.items():
         per_hop[hop] = per_hop.get(hop, 0) + 1
     return {"links": len(links), "neurons": len(best), "per_hop": dict(sorted(per_hop.items())),
-            "note": "weight-only direct-path links chained; paths past hop 1 are leads, not circuits",
+            "note": "weight-only direct-path links chained; paths past hop 1 are leads, not circuits" if rt.con_index()
+            else "no connection index yet: run explorer/build_connections.py",
             "nodes": [{"neuron": f"L{l} N{m}", "hop": hop, "z": round(abs(z), 1), "sign": 1 if z > 0 else -1,
                        "steer_up": [v[t] for t in idx["up"][l, m, :5]], "name": nm.get(f"L{l}/N{m}") or None}
                       for (l, m), (z, hop) in nodes]}
@@ -880,7 +883,14 @@ def agent_prompt_file():
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
             text = text.rstrip() + "\n\n" + open(extra).read()
-    text = text.replace("{ROOT}", ROOT).replace("{MODEL}", MODEL)
+    fill = {"ROOT": ROOT, "MODEL": MODEL, "N_LAYERS": ARCH["n_layers"], "INTER": ARCH["inter"], "HIDDEN": ARCH["hidden"],
+            "HEADS": ARCH["attn_heads"], "WINDOW": ARCH["sliding_window"],
+            "GLOBAL": ", ".join(str(i) for i, t in enumerate(ARCH["layer_types"]) if t == "full_attention"),
+            "PLE_NOTE": "" if not getattr(_cfg, "hidden_size_per_layer_input", 0) else (
+                " Gemma 4 also adds a per-layer token embedding after each MLP and scales each layer's output by a"
+                " learned scalar; steering units already account for the scalar.")}
+    for key, val in fill.items():
+        text = text.replace("{" + key + "}", str(val))
     out = os.path.join(AGENT_DIR, "system_prompt.md")
     if not os.path.exists(out) or open(out).read() != text:
         with open(out, "w") as f:

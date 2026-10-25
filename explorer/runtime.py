@@ -1,10 +1,12 @@
-"""Live Gemma 3 model for the explorer: steered generation (add or multiply one neuron, per batch row), per-token
-neuron activations on arbitrary text, and logit-lens tokens for a neuron's write column.
+"""Live Gemma model (Gemma 4 E4B by default, or Gemma 3) for the explorer: steered generation (add or multiply one
+neuron, per batch row), per-token neuron activations on arbitrary text, and logit-lens tokens for a neuron's write
+column.
 
 Reading and multiplying hook the input of a layer's down_proj, where the neuron activations gelu(gate) * up live.
 Adding pushes along the neuron's write column after the post-feedforward norm (see sweep/model_spec.py), the same
 place the sweep steers in vLLM (`mlp_out`). Add doses are in units of the median residual norm leaving the layer, the
-same unit as the sweep's `--dose-unit rel`.
+same unit as the sweep's `--dose-unit rel` (on Gemma 4, divided by the layer's output scalar, which multiplies the push
+afterwards).
 """
 import json
 import os
@@ -18,7 +20,8 @@ import torch
 from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sweep"))
-from model_spec import MODEL, TAG, chat_ids, end_ids, load, pre_mlp_scale, write_cols  # noqa: E402
+from model_spec import (MODEL, TAG, chat_ids, end_ids, layer_scalar, load, norm_scale, pre_mlp_scale,  # noqa: E402
+                        text_ids, write_cols)
 
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
@@ -74,8 +77,8 @@ class Runtime:
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
                 layer.post_feedforward_layernorm.register_forward_hook(self._add_hook(i))
                 layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (o_proj, 8 x 256 on Gemma 3 4B,
-                # sliding-window and global layers alike)
+                # attention output projection: its input is the heads side by side (o_proj; 8 heads on both models,
+                # 256 wide, or 512 on Gemma 4's global layers)
                 a = layer.self_attn
                 a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
             self.status = "ready"
@@ -148,7 +151,7 @@ class Runtime:
         if os.path.exists(path):
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
-            ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids.to(self.dev)
+            ids = torch.tensor([text_ids(self.tok, REFERENCE_TEXT)], device=self.dev)
             self._seen["want_resid"] = layer
             with torch.inference_mode():
                 self.lm(input_ids=ids, use_cache=False)
@@ -160,7 +163,7 @@ class Runtime:
     def down_col(self, layer, n):
         """Neuron n's write column: the direction it adds to the residual stream (see sweep/model_spec.py)."""
         L = self.lm.layers[layer]
-        return L.mlp.down_proj.weight[:, n].float() * (1.0 + L.post_feedforward_layernorm.weight.float())
+        return L.mlp.down_proj.weight[:, n].float() * norm_scale(L.post_feedforward_layernorm)
 
     # ---------- steering ----------
     def chat_ids(self, prompt):
@@ -254,7 +257,8 @@ class Runtime:
             vals, u = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows], None
         else:
             w = self.down_col(layer, n)
-            vals, u = [r * dose * self.layer_resid_p50(layer) for r in rows], w / w.norm()
+            p = dose * self.layer_resid_p50(layer) / layer_scalar(self.lm.layers[layer])
+            vals, u = [r * p for r in rows], w / w.norm()
         return (layer, n, mode, torch.tensor(vals, device=self.dev), u)
 
     def read(self, layer, n, text, chat=True, pushes=None, heads=None):
@@ -268,7 +272,7 @@ class Runtime:
             if chat:
                 ids = self.chat_ids(text)
             else:
-                ids = self.tok(text).input_ids
+                ids = text_ids(self.tok, text)
             self._read = (layer, n)
             self._push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
             self._heads = list(heads) or None if heads else None
@@ -291,7 +295,7 @@ class Runtime:
         reply) followed by `prefix`, as a [vocab] tensor. With pushes / heads (same units as read()) it also returns
         the same distribution under that intervention: (base, intervened or None)."""
         self.ensure_loaded()
-        ids = self.chat_ids(text) if chat else self.tok(text).input_ids
+        ids = self.chat_ids(text) if chat else text_ids(self.tok, text)
         if prefix:
             ids = ids + self.tok(prefix, add_special_tokens=False).input_ids
 
@@ -364,8 +368,8 @@ class Runtime:
     # ---------- connections ----------
     def connections(self, layer, n, k=24, lens_k=5):
         """Direct-path weights between neuron (layer, n) and neurons in other layers, ignoring everything between.
-        Downstream B in layer j > layer: g = W_gate_j[B] . ((1 + w_j) * d_n), u = W_up_j[B] . (...), where d_n is this
-        neuron's write column and w_j the pre-MLP norm weight. Upstream A in layer i < layer: the same with A's write
+        Downstream B in layer j > layer: g = W_gate_j[B] . (s_j * d_n), u = W_up_j[B] . (...), where d_n is this
+        neuron's write column and s_j the pre-MLP norm's scale. Upstream A in layer i < layer: the same with A's write
         column against this neuron's gate and up rows. Score = |g * u| z-scored within each layer; sign = sign(g * u).
         Each returned neuron carries its own logit-lens tokens."""
         key = (layer, n, k, lens_k)

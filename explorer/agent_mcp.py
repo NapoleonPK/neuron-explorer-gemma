@@ -70,8 +70,8 @@ TOOLS = [
      "it as a user turn). Compare against act_range from `neuron`. Optional `neurons` [{layer, n, dose?, mode?}] are "
      "pushed during the same pass (steering units), to test causally whether they drive this neuron: compare with the "
      "same call without them. {layer, all: true, dose: 0} zeroes that layer's whole MLP. Optional `heads` [{layer, "
-     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; every layer has 8 heads (global "
-     "attention at 5, 11, 17, 23, 29, sliding-window elsewhere; layer types are in `overview`). Only earlier layers can move it. Needs "
+     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; head counts and which layers "
+     "attend globally are in `overview`). Only earlier layers can move it. Needs "
      "the live model; errors if it is off.",
      "inputSchema": {"type": "object", "properties": {**LN, "text": {"type": "string"},
                                                        "chat": {"type": "boolean", "default": False},

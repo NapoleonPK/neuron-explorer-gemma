@@ -2,8 +2,9 @@
 
 Steering neuron n adds a multiple of its write column c_n (W_down[:, n] scaled by Gemma's post-feedforward norm, see
 model_spec.py) to the normed MLP branch at every position (prompt and generated): the steering fork of vLLM's `mlp_out`
-hook, which on Gemma 3 sits after post_feedforward_layernorm. With --dose-unit rel (the one to use on Gemma) the push
-is d x the median residual norm leaving the layer, the same size for every neuron. With --dose-unit absmax it is
+hook, which on Gemma sits after post_feedforward_layernorm. With --dose-unit rel (the one to use on Gemma) the push
+is d x the median residual norm leaving the layer, the same size for every neuron (on Gemma 4 it is sent divided by
+the layer's output scalar, which multiplies it on the way out). With --dose-unit absmax it is
 d * abs_max[n] * c_n, abs_max the neuron's largest |activation| over the stats corpus; on Gemma that only
 approximates raising the activation by d * abs_max[n], since the norm rescales the whole MLP branch.
 
@@ -23,9 +24,9 @@ Each rollout keeps:
     recoverable from these as gelu(W_gate x) * (W_up x). Activations at generated tokens come from replaying
     the saved token ids through the model with the same steering, one teacher-forced forward pass.
 
-    uv run python sweep/steer_sweep.py --stats stats/g3-4b_L17.npz --design main_rel --dose-unit rel --neurons 2742 --run smoke-2742
-    uv run python sweep/steer_sweep.py --stats stats/g3-4b_L17.npz --design calib --dose-unit rel --neurons random:128 --random-controls 64 --run calib-L17
-    uv run python sweep/steer_sweep.py --stats stats/g3-4b_L17.npz --design main_rel --dose-unit rel --neurons all --run g3-4b-L17
+    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --design main_rel --dose-unit rel --neurons 2742 --run smoke-2742
+    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --design calib --dose-unit rel --neurons random:128 --random-controls 64 --run calib-L17
+    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --design main_rel --dose-unit rel --neurons all --run gemma-4-e4b-L17
 
 Rerunning the same command resumes: rollouts already in the jsonl are skipped.
 """
@@ -120,6 +121,7 @@ def main():
     neurons = parse_neurons(a.neurons, len(abs_max), a.seed)
     design = DESIGNS[a.design]
     resid_p50 = float(st["resid_norm_q10_50_90"][1])
+    scalar = float(st["layer_scalar"]) if "layer_scalar" in st.files else 1.0
     down_norm = np.linalg.norm(w_down.astype(np.float32), axis=1)
     text_cfg = AutoConfig.from_pretrained(a.model).get_text_config()
     assert not getattr(text_cfg, "layer_scale", False), "mlp_out sits after an FFN layer scale on this model, so " \
@@ -184,10 +186,10 @@ def main():
         if ref is None:
             job["add"] = 0.0
         elif a.dose_unit == "rel":
-            job["add"] = float(d * resid_p50 / down_norm[ref])
+            job["add"] = float(d * resid_p50 / (down_norm[ref] * scalar))
         else:
             job["add"] = float(d * abs_max[ref])
-        job["rel_push"] = abs(job["add"]) * float(down_norm[ref]) / resid_p50 if ref is not None else 0.0
+        job["rel_push"] = abs(job["add"]) * float(down_norm[ref]) * scalar / resid_p50 if ref is not None else 0.0
         job["capture_id"] = f"L{layer}_{kind}{n}_{p}_{d:+g}".replace("+", "p").replace("-", "m")
         kw = {"temperature": 0.0, "max_tokens": a.max_tokens, "logprobs": a.top_k}
         if ref is not None:
