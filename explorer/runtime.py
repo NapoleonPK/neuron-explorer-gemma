@@ -1,20 +1,25 @@
-"""Live Qwen3.5 model for the explorer: steered generation (add or multiply one neuron, per batch row), per-token
-neuron activations on arbitrary text, and logit-lens tokens for a neuron's down column.
+"""Live Gemma 3 model for the explorer: steered generation (add or multiply one neuron, per batch row), per-token
+neuron activations on arbitrary text, and logit-lens tokens for a neuron's write column.
 
-The hook sits on the input of a layer's down_proj, where the neuron activations silu(gate) * up live, so add,
-multiply, and reading are all exact. Add doses are in units of the median residual norm leaving the layer, the same
-unit as the sweep's `--dose-unit rel`.
+Reading and multiplying hook the input of a layer's down_proj, where the neuron activations gelu(gate) * up live.
+Adding pushes along the neuron's write column after the post-feedforward norm (see sweep/model_spec.py), the same
+place the sweep steers in vLLM (`mlp_out`). Add doses are in units of the median residual norm leaving the layer, the
+same unit as the sweep's `--dose-unit rel`.
 """
 import json
 import os
 import sqlite3
 import threading
 
+import sys
+
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sweep"))
+from model_spec import MODEL, TAG, chat_ids, end_ids, load, pre_mlp_scale, write_cols  # noqa: E402
+
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -40,7 +45,7 @@ class Runtime:
         self.model = self.tok = None
         self.status = "idle"
         self.resid_p50 = {}
-        self._push = None  # [(layer, neuron, mode, per-row values tensor)], any number of neurons at once (neuron None = all)
+        self._push = None  # [(layer, neuron, mode, per-row values, unit write column or None)], any number at once (neuron None = all)
         self._heads = None  # [(layer, head, scale)]: attention heads scaled (0 = ablated) during a read; head None = all
         self._read = None  # (layer, neuron) while reading
         self._seen = {}
@@ -62,19 +67,17 @@ class Runtime:
             self.status = "loading"
             dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
             self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
+            m, lm = load(MODEL, dev)
+            self.dev, self.model, self.lm = dev, m, lm
+            self._ends = end_ids(self.tok)
             for i, layer in enumerate(self.lm.layers):
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
+                layer.post_feedforward_layernorm.register_forward_hook(self._add_hook(i))
                 layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
-                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
-                if hasattr(layer, "self_attn"):
-                    a = layer.self_attn
-                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
-                else:
-                    a = layer.linear_attn
-                    a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
+                # attention output projection: its input is the heads side by side (o_proj, 8 x 256 on Gemma 3 4B,
+                # sliding-window and global layers alike)
+                a = layer.self_attn
+                a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
             self.status = "ready"
 
     def _hook(self, i):
@@ -90,17 +93,26 @@ class Runtime:
             if self._read is not None and self._read[0] == i:
                 n = self._read[1]
                 self._seen["act"] = h[0, :, n].float().cpu()
-            mine = [p for p in self._push if p[0] == i] if self._push else []
+            mine = [p for p in self._push if p[0] == i and p[2] == "mul"] if self._push else []
             if mine:
                 h = h.clone()
-                for _, n, mode, vals in mine:
-                    if n is None:  # the whole layer's MLP (multiply only)
+                for _, n, _, vals, _ in mine:
+                    if n is None:  # the whole layer's MLP
                         h = h * vals[:, None, None].to(h.dtype)
-                    elif mode == "mul":
-                        h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
                     else:
-                        h[:, :, n] = h[:, :, n] + vals[:, None].to(h.dtype)
+                        h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
                 return (h,)
+        return hook
+
+    def _add_hook(self, i):
+        """Additive pushes land on the normed MLP branch, along each neuron's unit write column."""
+        def hook(mod, inp, out):
+            mine = [p for p in self._push if p[0] == i and p[2] != "mul"] if self._push else []
+            if not mine:
+                return None
+            for _, _, _, vals, u in mine:
+                out = out + (vals[:, None, None] * u[None, None, :]).to(out.dtype)
+            return out
         return hook
 
     def _head_hook(self, i, n_heads):
@@ -119,8 +131,8 @@ class Runtime:
         return hook
 
     def n_heads(self, layer):
-        L = self.lm.layers[layer]
-        return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
+        a = self.lm.layers[layer].self_attn
+        return a.o_proj.in_features // a.head_dim
 
     def _resid_hook(self, i):
         def hook(mod, inp, out):
@@ -132,7 +144,7 @@ class Runtime:
     def layer_resid_p50(self, layer):
         if layer in self.resid_p50:
             return self.resid_p50[layer]
-        path = os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz")
+        path = os.path.join(self.stats_dir, f"{TAG}_L{layer}.npz")
         if os.path.exists(path):
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
@@ -146,15 +158,16 @@ class Runtime:
         return v
 
     def down_col(self, layer, n):
-        return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+        """Neuron n's write column: the direction it adds to the residual stream (see sweep/model_spec.py)."""
+        L = self.lm.layers[layer]
+        return L.mlp.down_proj.weight[:, n].float() * (1.0 + L.post_feedforward_layernorm.weight.float())
 
     # ---------- steering ----------
     def chat_ids(self, prompt):
         return self.messages_ids([{"role": "user", "content": prompt}])
 
     def messages_ids(self, messages):
-        enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
-        return list(enc["input_ids"] if hasattr(enc, "keys") else enc)
+        return chat_ids(self.tok, messages)
 
     def steer_stream(self, layer, n, rows_messages, dose, mode, max_new=200, cancel=None):
         """Greedy-decodes three conversations in one batch: row 0 pushed up, row 1 unsteered, row 2 pushed down.
@@ -178,7 +191,6 @@ class Runtime:
                 ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
-                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
                 self._push = push
                 with torch.inference_mode():
@@ -192,7 +204,7 @@ class Runtime:
                             if done[r]:
                                 continue
                             t = int(nxt[r])
-                            if t == eos:
+                            if t in self._ends:
                                 done[r] = True
                                 continue
                             out_ids[r].append(t)
@@ -233,17 +245,17 @@ class Runtime:
 
     # ---------- reading ----------
     def _push_entry(self, layer, n, dose, mode, rows):
-        """One neuron's push for the down_proj hook, per batch row: rows holds +1 (pushed), 0 (left alone) or -1
-        (pushed the other way). add doses are in units of the layer's median residual norm along the neuron's down
-        column; mul doses multiply the activation (left alone = x1, the other way = x -dose)."""
+        """One neuron's push, per batch row: rows holds +1 (pushed), 0 (left alone) or -1 (pushed the other way).
+        add doses are in units of the layer's median residual norm along the neuron's write column, added after the
+        post-feedforward norm; mul doses multiply the activation (left alone = x1, the other way = x -dose)."""
         if n is None and mode != "mul":
             raise ValueError("a whole-layer MLP push must be mode 'mul' (e.g. dose 0 to ablate)")
         if mode == "mul":
-            vals = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows]
+            vals, u = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows], None
         else:
-            unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
-            vals = [r * dose * unit for r in rows]
-        return (layer, n, mode, torch.tensor(vals, device=self.dev))
+            w = self.down_col(layer, n)
+            vals, u = [r * dose * self.layer_resid_p50(layer) for r in rows], w / w.norm()
+        return (layer, n, mode, torch.tensor(vals, device=self.dev), u)
 
     def read(self, layer, n, text, chat=True, pushes=None, heads=None):
         """Per-token activation of neuron n at `layer` on `text` (as a user turn when chat=True), optionally with other
@@ -353,7 +365,7 @@ class Runtime:
     def connections(self, layer, n, k=24, lens_k=5):
         """Direct-path weights between neuron (layer, n) and neurons in other layers, ignoring everything between.
         Downstream B in layer j > layer: g = W_gate_j[B] . ((1 + w_j) * d_n), u = W_up_j[B] . (...), where d_n is this
-        neuron's down column and w_j the pre-MLP norm weight. Upstream A in layer i < layer: the same with A's down
+        neuron's write column and w_j the pre-MLP norm weight. Upstream A in layer i < layer: the same with A's write
         column against this neuron's gate and up rows. Score = |g * u| z-scored within each layer; sign = sign(g * u).
         Each returned neuron carries its own logit-lens tokens."""
         key = (layer, n, k, lens_k)
@@ -389,20 +401,20 @@ class Runtime:
         with self.lock, torch.inference_mode():
             dt = self.model.dtype
             out = {"down": [], "up": []}
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n]
+            d = self.down_col(layer, n).to(dt)
             me = self.lm.layers[layer]
-            scale_me = (1.0 + me.post_attention_layernorm.weight.float()).to(dt)
+            scale_me = pre_mlp_scale(me).to(dt)
             r_g = me.mlp.gate_proj.weight[n] * scale_me
             r_u = me.mlp.up_proj.weight[n] * scale_me
             for j, Lyr in enumerate(self.lm.layers):
                 if j == layer:
                     continue
                 if j > layer:
-                    v = d * (1.0 + Lyr.post_attention_layernorm.weight.float()).to(dt)
+                    v = d * pre_mlp_scale(Lyr).to(dt)
                     g, u = (Lyr.mlp.gate_proj.weight @ v).float(), (Lyr.mlp.up_proj.weight @ v).float()
                     side = "down"
                 else:
-                    W = Lyr.mlp.down_proj.weight
+                    W = write_cols(Lyr)
                     g, u = (r_g @ W).float(), (r_u @ W).float()
                     side = "up"
                 prod = g * u
@@ -421,7 +433,7 @@ class Runtime:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
             elif every and lens_k:
-                D = torch.stack([self.lm.layers[c["layer"]].mlp.down_proj.weight[:, c["n"]] for c in every])
+                D = torch.stack([self.down_col(c["layer"], c["n"]).to(dt) for c in every])
                 logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
@@ -436,8 +448,8 @@ class Runtime:
         return out
 
     # ---------- logit-lens index over every neuron ----------
-    def build_lens_index(self, path, k=12, chunk=1024):
-        """Top-k tokens each neuron's down column pushes up and down, for every layer. Saved as int32 arrays
+    def build_lens_index(self, path, k=12, chunk=512):
+        """Top-k tokens each neuron's write column pushes up and down, for every layer. Saved as int32 arrays
         up[L, N, k], down[L, N, k]."""
         self.ensure_loaded()
         L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
@@ -446,7 +458,7 @@ class Runtime:
         for li, layer in enumerate(self.lm.layers):
             self.status = f"indexing lens {li}/{L}"
             with self.lock, torch.inference_mode():
-                W = layer.mlp.down_proj.weight  # [hidden, inter]
+                W = write_cols(layer)  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
                     logits = self.model.lm_head(self.lm.norm(D))[:, 0]
@@ -491,8 +503,8 @@ class Runtime:
         buf, seen = [], 0
         for d in load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True).shuffle(seed=seed):
             buf += self.tok(d["text"], add_special_tokens=False).input_ids + [self.tok.eos_token_id]
-            while len(buf) >= seq and seen < tokens:
-                chunk, buf = buf[:seq], buf[seq:]
+            while len(buf) >= seq - 1 and seen < tokens:
+                chunk, buf = [self.tok.bos_token_id] + buf[:seq - 1], buf[seq - 1:]
                 self.status = f"measuring neuron ranges {seen // 1000}k/{tokens // 1000}k tokens"
                 acts = self.all_activations(chunk, skip_first=True)
                 for l, (mx, _, mn, _) in acts.items():

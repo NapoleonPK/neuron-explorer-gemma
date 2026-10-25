@@ -33,7 +33,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
       const full = p.full;
-      return showTip(x, y, `L${p.layer}`, full ? `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
+      return showTip(x, y, `L${p.layer}`, `${full ? "global attention" : `sliding-window attention (${arch.sliding_window} tokens)`} · ${arch.attn_heads} q / ${arch.kv_heads} kv heads`);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
     const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;

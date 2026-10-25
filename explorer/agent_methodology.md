@@ -1,6 +1,10 @@
-# Interpreting neurons in Qwen3.5-4B: methodology
+# Interpreting neurons: methodology
 
-A working method for explaining a single MLP neuron, built from hands-on investigation in the explorer. It complements the explorer prompt above and uses its vocabulary (poles, steer lens, cone, web summary).
+A working method for explaining a single MLP neuron, built from hands-on investigation in the explorer.
+
+The worked examples below (`L20 N7531` and the others) come from the original Qwen3.5-4B explorer this one is ported
+from. Neuron ids do not carry over to Gemma 3 4B: read them as illustrations of patterns, never as neurons to look up
+here. It complements the explorer prompt above and uses its vocabulary (poles, steer lens, cone, web summary).
 
 ## Mindset
 
@@ -31,7 +35,7 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 ## Motifs seen in this model
 
 - **Lookahead.** Many neurons fire on the token before the thing they predict: `L25 N4719−` peaks at "r times **the**" before "cosine" (−15) and at "sin² **+**" before "cos²"; `L22 N5826` peaks at "while **the**" before "dashed".
-- **Summary positions.** Mood and planning neurons peak on commas, periods, `?`, `</think>` and the blank line before a reply, where attention gathers the text so far. `L22 N3467` (critical warning) reaches 6.2 at `</think>` before an answer to a bleach question.
+- **Summary positions.** Mood and planning neurons peak on commas, periods, `?`, and the turn markers before a reply (`<end_of_turn>`, `model`), where attention gathers the text so far. `L22 N3467` (critical warning) reaches 6.2 at `</think>` before an answer to a bleach question.
 - **Reads one way, writes the other.** Some neurons fire positive on a topic while their positive direction writes the opposite register: `L18 N8827` fires on lurid content and, pushed positive, makes text gentle and serene; its negative pole is obscenity.
 - **Fed and held by the same topic.** A neuron that draws a distinction inside a topic is wired to neurons on both sides of it. `L10 N6032` is fed by `unsafe`, `vulnerable`, `attack` and held by `secure`, `Police`, `FDA`: it marks danger with no safeguard in place.
 - **One direction, signed by context (gain control).** `L23 N7748` adds eggs in counted-ingredient slots (+5.75 at "a dozen") and, at −3.3 in "bacon and fried", holds eggs back so `potatoes` and `toast` stay in play. Logprobs confirm both.
@@ -53,16 +57,4 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 
 ## Reference neurons
 
-- `L10 N6032+`: risky how-to request ("How do I store gasoline?") → caution voice (`我必须` I must, `我无法` I can't).
-- `L11 N6261+`: refusal lever; +1.5 moves the first reply token from "I" (99.6%) to "Sure / Yes / Absolutely".
-- `L12 N699`: + AI self-limitation ("I can only…"), − bubbly persona ("What a fun day!").
-- `L18 N6311`: + frame as a method ("the sourdough method… why this works"), − pontificate about the topic.
-- `L18 N8737+`: sexual desire → euphemistic bedroom talk.
-- `L19 N7839−`: conspiracy / "the truth they don't want you to know" (−12.6), weak as a steering lever.
-- `L19 N9066+`: felt panic (7.3 on exam panic), writes anxious rambling at +0.8.
-- `L20 N7531`: comparing amounts → which item / how they rank.
-- `L22 N3467`: plans a ⚠️ critical warning before answering a hazardous request.
-- `L22 N5826`: a line style comes next (dashed / dotted / broken).
-- `L23 N7748`: writes eggs; + counted-ingredient slots, − keeps other foods in play.
-- `L25 N4719−`: cosine comes next (x-component → cos).
-- `L26 N4405`: writes zero; trigger unknown.
+None yet for Gemma 3 4B. Add neurons here once they are understood, in the form `L<layer> N<n>±: what it does`.

@@ -9,14 +9,14 @@ source /workspace/env.sh
 # shellcheck disable=SC1091
 source .venv/bin/activate
 mkdir -p stats runs
-need=""; for l in $LAYERS; do [ -f "stats/q35-4b_L$l.npz" ] || need="$need,$l"; done
+need=""; for l in $LAYERS; do [ -f "stats/g3-4b_L$l.npz" ] || need="$need,$l"; done
 if [ -n "$need" ]; then
-  python sweep/neuron_stats.py --layers "${need#,}" --tokens 200000 --out stats/q35-4b > depth_stats.log 2>&1
+  python sweep/neuron_stats.py --layers "${need#,}" --tokens 200000 --out stats/g3-4b > depth_stats.log 2>&1
 fi
 for l in $LAYERS; do
   echo "L$l start $(date)" >> depth.log
-  python sweep/steer_sweep.py --stats "stats/q35-4b_L$l.npz" --design main_rel --dose-unit rel --neurons "random:$NNEUR" \
-    --random-controls "$NCTRL" --max-num-seqs 320 --run "q35-4b-L$l-r$NNEUR" > "sweep_L$l-r$NNEUR.log" 2>&1 \
+  python sweep/steer_sweep.py --stats "stats/g3-4b_L$l.npz" --design main_rel --dose-unit rel --neurons "random:$NNEUR" \
+    --random-controls "$NCTRL" --max-num-seqs 320 --run "g3-4b-L$l-r$NNEUR" > "sweep_L$l-r$NNEUR.log" 2>&1 \
     && echo "L$l done $(date)" >> depth.log || echo "L$l FAILED $(date)" >> depth.log
 done
 echo ALL_DONE >> depth.log

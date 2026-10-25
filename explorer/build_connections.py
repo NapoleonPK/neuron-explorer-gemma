@@ -1,8 +1,8 @@
 """Direct-path connections for every neuron in every layer, for the explorer's details tab.
 
-For layers i < j, P[B, A] = (W_gate_j[B] . v_A) * (W_up_j[B] . v_A) with v_A = (1 + w_j) * W_down_i[:, A], w_j the
-pre-MLP norm weight of layer j. Neuron A's downstream links in layer j are column A of P, |P| z-scored over B; neuron
-B's upstream links in layer i are row B of P, |P| z-scored over A. Each neuron keeps its k strongest links per side
+For layers i < j, P[B, A] = (W_gate_j[B] . v_A) * (W_up_j[B] . v_A) with v_A = (1 + w_j) * c_A, c_A neuron A's write
+column (sweep/model_spec.py) and w_j the pre-MLP norm weight of layer j. Neuron A's downstream links in layer j are
+column A of P, |P| z-scored over B; neuron B's upstream links in layer i are row B of P, |P| z-scored over A. Each neuron keeps its k strongest links per side
 across all layers, with sign(P).
 
     uv run python explorer/build_connections.py            # CUDA, about 5 min on a 4090
@@ -11,38 +11,30 @@ Writes explorer/cache/connections.npz: {down,up}_layer [L, N, k] int8, {down,up}
 {down,up}_sign int8.
 """
 import argparse
-import json
 import os
+import sys
 import time
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sweep"))
+from model_spec import MODEL, Checkpoint  # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+ap.add_argument("--model", default=MODEL)
 ap.add_argument("--k", type=int, default=24)
 ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "connections.npz"))
 a = ap.parse_args()
 dev = "cuda" if torch.cuda.is_available() else "mps"
 
-root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
-index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
-L, N, K = cfg["num_hidden_layers"], cfg["intermediate_size"], a.k
-
-
-def tensor(name):
-    with safe_open(os.path.join(root, index[name]), "pt") as f:
-        return f.get_tensor(name).to(dev, torch.bfloat16)
-
-
-pre = "model.language_model.layers.{}."
-down = [tensor(pre.format(l) + "mlp.down_proj.weight") for l in range(L)]
-gate = [tensor(pre.format(l) + "mlp.gate_proj.weight") for l in range(L)]
-up = [tensor(pre.format(l) + "mlp.up_proj.weight") for l in range(L)]
-norm = [(1.0 + tensor(pre.format(l) + "post_attention_layernorm.weight").float()).to(torch.bfloat16) for l in range(L)]
+ck = Checkpoint(a.model)
+L, N, K = ck.cfg["num_hidden_layers"], ck.cfg["intermediate_size"], a.k
+bf = lambda t: t.to(dev, torch.bfloat16)
+down = [bf(ck.write_cols(l)) for l in range(L)]  # write columns, [hidden, N]
+gate = [bf(ck.tensor(l, "mlp.gate_proj.weight")) for l in range(L)]
+up = [bf(ck.tensor(l, "mlp.up_proj.weight")) for l in range(L)]
+norm = [bf(1.0 + ck.tensor(l, "pre_feedforward_layernorm.weight").float()) for l in range(L)]
 
 # running top-k per neuron and side: score, source layer, source neuron, sign
 best = {s: (torch.full((L, N, K), -1e9, device=dev), torch.zeros((L, N, K), dtype=torch.int16, device=dev),

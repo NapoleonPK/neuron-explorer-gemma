@@ -3,7 +3,7 @@ than random directions do, per layer, plus coherence numbers per dose and each l
 
     uv run python sweep/depth_report.py --out runs/depth_report.json
 
-Ranks runs/q35-4b-L{l}-r384.jsonl, writing <run>.units.jsonl. Layers with only a full run (-full.jsonl) are subsampled
+Ranks runs/g3-4b-L{l}-r384.jsonl, writing <run>.units.jsonl. Layers with only a full run (-full.jsonl) are subsampled
 to the same pool size (384 neurons, 64 controls) so word-cluster mass is comparable across layers.
 """
 import argparse
@@ -25,10 +25,10 @@ lo, _, hi = a.layers.partition("-")
 
 report = []
 for l in range(int(lo), int(hi or lo) + 1):
-    path = f"runs/q35-4b-L{l}-r{a.neurons}.jsonl"
+    path = f"runs/g3-4b-L{l}-r{a.neurons}.jsonl"
     sub = False
     if not os.path.exists(path):
-        path, sub = f"runs/q35-4b-L{l}-full.jsonl", True
+        path, sub = f"runs/g3-4b-L{l}-full.jsonl", True
         if not os.path.exists(path):
             continue
     rows = [json.loads(x) for x in open(path)]

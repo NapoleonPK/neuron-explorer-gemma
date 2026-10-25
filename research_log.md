@@ -1,3 +1,5 @@
+> Findings from the original project, on **Qwen3.5-4B**. Neuron ids here do not carry over to the Gemma 3 4B port.
+
 # Research log: steering-first neuron explorer
 
 ## Framing (2026-10-18)

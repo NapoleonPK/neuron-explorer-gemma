@@ -1,12 +1,13 @@
 """GPU check of the two equivalences the steering sweep rests on. Run once on a new box before a full sweep.
 
-1. Steering: the fork adding v * W_down[:, n] at mlp_out gives the same greedy rollout as HF adding v to neuron n's
-   activation (a forward-pre-hook on down_proj). HF and vLLM kernels differ in bf16 rounding, so the reference is how
-   well an unsteered rollout agrees across the two engines; steered agreement should look the same.
-2. Capture: neuron activations recomputed from a captured mlp_in, silu(W_gate x) * (W_up x), match HF's activations
+1. Steering: the fork adding v * c_n (neuron n's write column, model_spec.py) at mlp_out gives the same greedy
+   rollout as HF adding it to the output of post_feedforward_layernorm, with v = dose x median residual norm / |c_n|
+   (the sweep's --dose-unit rel). HF and vLLM kernels differ in bf16 rounding, so the reference is how well an
+   unsteered rollout agrees across the two engines; steered agreement should look the same.
+2. Capture: neuron activations recomputed from a captured mlp_in, gelu(W_gate x) * (W_up x), match HF's activations
    at the same tokens (all prompt positions; capture positions must exist when a request is admitted).
 
-    uv run python sweep/check_equivalence.py --stats stats/q35-4b_L22.npz --neurons 2742,17,5000
+    uv run python sweep/check_equivalence.py --stats stats/g3-4b_L17.npz --neurons 2742,17,5000
 """
 import argparse
 import os
@@ -14,10 +15,12 @@ import shutil
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 from vllm.v1.capture.consumers.filesystem.reader import read_request
+
+from model_spec import MODEL, chat_ids, load
 
 
 def common_prefix(a, b):
@@ -31,10 +34,10 @@ def common_prefix(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=MODEL)
     ap.add_argument("--stats", required=True)
     ap.add_argument("--neurons", default="2742,17,5000")
-    ap.add_argument("--doses", default="10,-2")
+    ap.add_argument("--doses", default="0.8,-0.7", help="fractions of the median residual norm")
     ap.add_argument("--prompt", default="Who are you?")
     ap.add_argument("--new", type=int, default=48)
     ap.add_argument("--capture-gen", type=int, default=8)
@@ -42,13 +45,13 @@ def main():
     a = ap.parse_args()
 
     st = np.load(a.stats)
-    layer, abs_max, w_down = int(st["layer"]), st["abs_max"], st["w_down"]
+    layer, w_write = int(st["layer"]), st["w_write"].astype(np.float32)
+    resid_p50 = float(st["resid_norm_q10_50_90"][1])
+    scale = lambda n, d: float(d * resid_p50 / np.linalg.norm(w_write[n]))
     neurons = [int(x) for x in a.neurons.split(",")]
     doses = [float(x) for x in a.doses.split(",")]
     tok = AutoTokenizer.from_pretrained(a.model)
-    enc = tok.apply_chat_template([{"role": "user", "content": a.prompt}], add_generation_prompt=True,
-                                  enable_thinking=False, tokenize=True)
-    ids = list(enc["input_ids"] if hasattr(enc, "keys") else enc)
+    ids = chat_ids(tok, [{"role": "user", "content": a.prompt}])
     plen = len(ids)
     cases = [(None, 0.0)] + [(n, d) for n in neurons for d in doses]
 
@@ -62,8 +65,7 @@ def main():
     for n, d in cases:
         kw = {"temperature": 0.0, "max_tokens": a.new}
         if n is not None:
-            kw["steering_vectors"] = {"mlp_out": {layer: {"vector": w_down[n].astype(np.float32).tolist(),
-                                                          "scale": float(d * abs_max[n])}}}
+            kw["steering_vectors"] = {"mlp_out": {layer: {"vector": w_write[n].tolist(), "scale": scale(n, d)}}}
         else:
             kw["capture"] = {"filesystem": {
                 "request_id": "baseline", "tag": "check", "layout": "per_file", "hooks": {"mlp_in": [layer]},
@@ -74,25 +76,25 @@ def main():
     print("capture result:", v_out[0].capture_results)
 
     # HF reference
-    # the transformers class directly: importing vllm re-registers its own qwen3_5 config with AutoConfig
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
-    mlp = model.model.language_model.layers[layer].mlp
+    model, lm = load(a.model, "cuda")
+    dec = lm.layers[layer]
+    mlp = dec.mlp
     push = {"n": None, "v": 0.0}
     seen = {}
 
-    def hook(m, inp):
-        h = inp[0]
-        seen["act"] = h.detach()
-        if push["n"] is not None:
-            h = h.clone()
-            h[..., push["n"]] += push["v"]
-            return (h,)
+    def read_hook(m, inp):
+        seen["act"] = inp[0].detach()
 
-    mlp.down_proj.register_forward_pre_hook(hook)
+    def add_hook(m, inp, out):
+        if push["n"] is not None:
+            return out + push["v"] * torch.tensor(w_write[push["n"]], device=out.device, dtype=out.dtype)
+
+    mlp.down_proj.register_forward_pre_hook(read_hook)
+    dec.post_feedforward_layernorm.register_forward_hook(add_hook)
     x = torch.tensor([ids], device="cuda")
     print(f"\nL{layer}, prompt {a.prompt!r}, {a.new} greedy tokens. agree = shared prefix length HF vs vLLM")
     for (n, d), vi in zip(cases, v_ids):
-        push.update(n=n, v=float(d * abs_max[n]) if n is not None else 0.0)
+        push.update(n=n, v=scale(n, d) if n is not None else 0.0)
         with torch.inference_mode():
             hi = model.generate(x, max_new_tokens=a.new, do_sample=False)[0, plen:].tolist()
         label = "baseline" if n is None else f"n{n} {d:+g}"
@@ -113,10 +115,10 @@ def main():
           f"got {e.positions}")
     xs = torch.tensor(arr, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():
-        recomputed = (torch.nn.functional.silu(mlp.gate_proj(xs)) * mlp.up_proj(xs)).float()
+        recomputed = (mlp.act_fn(mlp.gate_proj(xs)) * mlp.up_proj(xs)).float()
     full = torch.tensor([ids + v_ids[0]], device="cuda")
     with torch.inference_mode():
-        model.model.language_model(input_ids=full, use_cache=False)
+        lm(input_ids=full, use_cache=False)
     ref = seen["act"][0].float()[torch.tensor(e.positions, device="cuda").clamp(max=full.shape[1] - 1)]
     rel = (recomputed - ref).norm(dim=-1) / ref.norm(dim=-1)
     same_top = (recomputed.argmax(-1) == ref.argmax(-1)).float().mean()

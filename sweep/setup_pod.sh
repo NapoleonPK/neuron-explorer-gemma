@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Prepares a fresh CUDA pod for the sweep: uv, Goodfire's steering fork of vLLM, the sweep's dependencies, the
-# linear-attention kernels HF uses (fla-core), and the model weights. Everything installs under /workspace, so a
-# stopped pod restarts ready. The fork's additions are Python + Triton, so it installs on top of the upstream wheel
-# built at the commit the fork last merged (755492e3). Run from /workspace/neuron-explorer.
+# Prepares a fresh CUDA pod for the sweep: uv, the steering fork of vLLM, the sweep's dependencies, and the model
+# weights. google/gemma-3-4b-it is gated: accept its license on Hugging Face and export HF_TOKEN first, or export
+# EXPLORER_MODEL=unsloth/gemma-3-4b-it (an ungated copy of the same weights), which every script reads. Everything
+# installs under /workspace, so a stopped pod restarts ready. The fork's additions are Python + Triton, so it installs
+# on top of the upstream wheel built at the commit the fork last merged (755492e3). Run from /workspace/neuron-explorer.
 set -euo pipefail
-MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
+MODEL="${EXPLORER_MODEL:-google/gemma-3-4b-it}"
 
 cat > /workspace/env.sh <<'EOF'
 export HF_HOME=/workspace/hf UV_CACHE_DIR=/workspace/.uv-cache UV_PYTHON_INSTALL_DIR=/workspace/.uv-python
@@ -27,6 +28,5 @@ source .venv/bin/activate
 (cd vllm-steer && VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_COMMIT=755492e37d7d7201d93f0effa200acac56601f38 \
     uv pip install -e . --torch-backend=auto)
 uv pip install datasets accelerate safetensors numpy
-uv pip install --no-deps flash-linear-attention fla-core einops
 wait $DL
-python -c "import vllm, transformers, torch, fla.ops.gated_delta_rule; print('vllm', vllm.__version__, '| transformers', transformers.__version__, '| torch', torch.__version__, '| fla ok | cuda', torch.cuda.get_device_name())"
+python -c "import vllm, transformers, torch; print('vllm', vllm.__version__, '| transformers', transformers.__version__, '| torch', torch.__version__, '| cuda', torch.cuda.get_device_name())"

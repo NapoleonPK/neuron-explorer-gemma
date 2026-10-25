@@ -1,9 +1,11 @@
 """Steer every neuron of one MLP layer, one rollout per (prompt, dose), and keep everything a rollout produces.
 
-Steering neuron n by dose d adds d * abs_max[n] to its activation at every position (prompt and generated). That is
-the same as adding d * abs_max[n] * W_down[:, n] to the layer's MLP output, which is what this sends to the steering
-fork of vLLM at the `mlp_out` hook. abs_max is the neuron's largest |activation| over the stats corpus, so doses are in
-units of the neuron's own range.
+Steering neuron n adds a multiple of its write column c_n (W_down[:, n] scaled by Gemma's post-feedforward norm, see
+model_spec.py) to the normed MLP branch at every position (prompt and generated): the steering fork of vLLM's `mlp_out`
+hook, which on Gemma 3 sits after post_feedforward_layernorm. With --dose-unit rel (the one to use on Gemma) the push
+is d x the median residual norm leaving the layer, the same size for every neuron. With --dose-unit absmax it is
+d * abs_max[n] * c_n, abs_max the neuron's largest |activation| over the stats corpus; on Gemma that only
+approximates raising the activation by d * abs_max[n], since the norm rescales the whole MLP branch.
 
 Design "main", per neuron, 10 rollouts: {who, snake, orange} x {-2, +2, +10} and {free} x {+10}. Design "calib" is a
 dose-response ladder, {who, orange, free} x ±{1, 2, 4, 8, 16, 32}, for finding where effects begin and where text
@@ -11,19 +13,19 @@ breaks. Design "main_rel" (with --dose-unit rel) gives every neuron the same pus
 residual norm: {who, snake, orange} x {-0.7, +0.5, +0.8} and {free} x {+3}. One unsteered baseline per prompt. Each
 rollout also records rel_push, the size of its push relative to the
 median residual norm leaving the layer.
-Random-direction controls (a neuron's down column rotated to a random direction, same norm and dose scale) get the
+Random-direction controls (a neuron's write column rotated to a random direction, same norm and dose scale) get the
 same rollouts as the neurons and give the null for "how often does a theme appear by chance".
 
 Each rollout keeps:
     text, generated token ids, the chosen token's logprob and the top-k alternatives at every step   (jsonl)
     mlp_in activations at the capture layers at the last prompt token, the state just before the model answers
     (vLLM filesystem capture under --capture-root/<run>/<capture_id>). Every neuron of a captured layer is
-    recoverable from these as silu(W_gate x) * (W_up x). Activations at generated tokens come from replaying
+    recoverable from these as gelu(W_gate x) * (W_up x). Activations at generated tokens come from replaying
     the saved token ids through the model with the same steering, one teacher-forced forward pass.
 
-    uv run python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --neurons 2742 --run smoke-2742
-    uv run python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --design calib --neurons random:128 --random-controls 64 --run calib-L22
-    uv run python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --neurons all --run q35-4b-L22
+    uv run python sweep/steer_sweep.py --stats stats/g3-4b_L17.npz --design main_rel --dose-unit rel --neurons 2742 --run smoke-2742
+    uv run python sweep/steer_sweep.py --stats stats/g3-4b_L17.npz --design calib --dose-unit rel --neurons random:128 --random-controls 64 --run calib-L17
+    uv run python sweep/steer_sweep.py --stats stats/g3-4b_L17.npz --design main_rel --dose-unit rel --neurons all --run g3-4b-L17
 
 Rerunning the same command resumes: rollouts already in the jsonl are skipped.
 """
@@ -37,6 +39,8 @@ import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
+
+from model_spec import MODEL, chat_ids
 
 PROMPTS = {
     "who": "Who are you?",
@@ -86,11 +90,11 @@ def rollout_record(out, job, layer, top_k):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=MODEL)
     ap.add_argument("--stats", required=True, help="npz from neuron_stats.py for the layer to steer")
     ap.add_argument("--neurons", default="all", help='"all", "random:128", "2742", "0-99", or "1,5,9-12"')
-    ap.add_argument("--design", default="main", choices=sorted(DESIGNS))
-    ap.add_argument("--dose-unit", default="absmax", choices=["absmax", "rel"], help="absmax: dose x the neuron's "
+    ap.add_argument("--design", default="main_rel", choices=sorted(DESIGNS))
+    ap.add_argument("--dose-unit", default="rel", choices=["absmax", "rel"], help="absmax: dose x the neuron's "
                     "abs_max; rel: dose x the median residual norm, the same push size for every neuron")
     ap.add_argument("--run", required=True, help="run name: output file and capture tag")
     ap.add_argument("--out-dir", default="runs")
@@ -111,7 +115,8 @@ def main():
     a = ap.parse_args()
 
     st = np.load(a.stats)
-    layer, abs_max, w_down = int(st["layer"]), st["abs_max"], st["w_down"]
+    layer, abs_max = int(st["layer"]), st["abs_max"]
+    w_down = st["w_write"] if "w_write" in st.files else st["w_down"]  # write columns; plain W_down on older stats
     neurons = parse_neurons(a.neurons, len(abs_max), a.seed)
     design = DESIGNS[a.design]
     resid_p50 = float(st["resid_norm_q10_50_90"][1])
@@ -123,12 +128,7 @@ def main():
     cap_layers = sorted({layer + int(x) for x in a.capture_layers.split(",") if x} & set(range(n_layers)))
 
     tok = AutoTokenizer.from_pretrained(a.model)
-    prompt_ids = {
-        k: tok.apply_chat_template([{"role": "user", "content": v}], add_generation_prompt=True,
-                                   enable_thinking=False, tokenize=True)
-        for k, v in PROMPTS.items()
-    }
-    prompt_ids = {k: list(v["input_ids"] if hasattr(v, "keys") else v) for k, v in prompt_ids.items()}
+    prompt_ids = {k: chat_ids(tok, [{"role": "user", "content": v}]) for k, v in PROMPTS.items()}
 
     os.makedirs(a.out_dir, exist_ok=True)
     out_path = os.path.join(a.out_dir, f"{a.run}.jsonl")
@@ -140,7 +140,7 @@ def main():
                    "capture_root": os.path.abspath(a.capture_root), "capture_tag": a.run,
                    "prompt_ids": prompt_ids}, f, indent=1)
 
-    # Random-direction controls: neuron j's down column rotated to a random direction (same norm, same abs_max).
+    # Random-direction controls: neuron j's write column rotated to a random direction (same norm, same abs_max).
     # They answer "how often does a theme appear when the steered direction means nothing?"
     rng = np.random.default_rng(a.seed)
     ctrl_ref = rng.integers(len(abs_max), size=a.random_controls)

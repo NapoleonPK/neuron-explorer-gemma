@@ -1,3 +1,5 @@
+> Notes from the original project, on **Qwen3.5-4B**.
+
 # Neuron explorer — source notes
 
 Three inputs, collected 2026-10-18.

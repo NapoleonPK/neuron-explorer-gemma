@@ -1,7 +1,7 @@
 """Throughput of the steering fork on this GPU under three conditions, same prompt and fixed-length rollouts:
 unsteered, a distinct steering config per request, and steering plus a last_prompt mlp_in capture.
 
-    uv run python sweep/bench.py --stats stats/q35-4b_L22.npz --n 1280 --max-num-seqs 320
+    uv run python sweep/bench.py --stats stats/g3-4b_L17.npz --n 1280 --max-num-seqs 320
 """
 import argparse
 import time
@@ -11,10 +11,12 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
+from model_spec import MODEL, chat_ids, end_ids
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=MODEL)
     ap.add_argument("--stats", required=True)
     ap.add_argument("--n", type=int, default=1280)
     ap.add_argument("--tokens", type=int, default=256)
@@ -25,11 +27,10 @@ def main():
     a = ap.parse_args()
 
     st = np.load(a.stats)
-    layer, abs_max, w_down = int(st["layer"]), st["abs_max"], st["w_down"]
+    layer, abs_max = int(st["layer"]), st["abs_max"]
+    w_down = st["w_write"] if "w_write" in st.files else st["w_down"]
     tok = AutoTokenizer.from_pretrained(a.model)
-    enc = tok.apply_chat_template([{"role": "user", "content": "Describe the color orange."}],
-                                  add_generation_prompt=True, enable_thinking=False, tokenize=True)
-    ids = list(enc["input_ids"] if hasattr(enc, "keys") else enc)
+    ids = chat_ids(tok, [{"role": "user", "content": "Describe the color orange."}])
     llm = LLM(model=a.model, dtype="bfloat16", enable_steering=True, max_steering_configs=a.max_configs,
               max_num_seqs=a.max_num_seqs, max_model_len=len(ids) + a.tokens + 16, gpu_memory_utilization=a.gpu_mem,
               limit_mm_per_prompt={"image": 0, "video": 0},
@@ -65,8 +66,9 @@ def main():
         outs = llm.generate(prompts, params, use_tqdm=False)
         dt = time.time() - t1
         n_tok = sum(len(o.outputs[0].token_ids) for o in outs)
-        eos = tok.convert_tokens_to_ids("<|im_end|>")
-        kept = sum((list(o.outputs[0].token_ids) + [eos]).index(eos) for o in outs)
+        ends = end_ids(tok)
+        kept = sum(next((j for j, t in enumerate(o.outputs[0].token_ids) if t in ends), len(o.outputs[0].token_ids))
+                   for o in outs)
         print(f"{name:18s} {n_tok / dt:8,.0f} gen tok/s  {kept / dt:8,.0f} kept tok/s  {a.n / dt:6.1f} rollouts/s  "
               f"(building params {t1 - t0:.1f}s)",
               flush=True)

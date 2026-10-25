@@ -5,7 +5,7 @@ import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 
 // geometry: layers run left to right along x. Each layer is the residual stream passing through a token-mixer slab
-// (linear or full attention) and then the MLP, drawn as a vertical sheet of its neurons.
+// (sliding-window or global attention) and then the MLP, drawn as a vertical sheet of its neurons.
 const SHEET = 4.2, GAP = 1.9, SHEET_Y0 = 0.7, ATTN_DX = -0.62, MLP_DX = 0.18;
 const PAL = {
   bg: 0x000000,
@@ -113,7 +113,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       new THREE.LineBasicMaterial({ color: full ? PAL.slabEdgeFull : PAL.slabEdge, transparent: true }));
     edges.position.copy(slab.position); scene.add(edges);
     slab.userData.edges = edges; slab.userData.baseOpacity = slab.material.opacity;
-    const heads = full ? arch.attn_heads : arch.linear_v_heads;
+    const heads = arch.attn_heads;
     for (let h = 0; h < heads; h++) {
       const z = ((h + 0.5) / heads - 0.5) * SHEET * 0.82;
       (full ? headPos.full : headPos.lin).push(ax + t / 2 + 0.003, SHEET_Y0 + 0.35, z, ax + t / 2 + 0.003, SHEET_Y0 + SHEET - 0.35, z);

@@ -1,11 +1,12 @@
-"""Downstream state of every rollout in a sweep run: the MLP input (post-attention-norm hidden state, the vector the
+"""Downstream state of every rollout in a sweep run: the MLP input (pre-feedforward-norm hidden state, the vector the
 gate and up projections read) at the last prompt token, at the run's capture layers, with the rollout's steering push
 applied at every prompt position. One prefill per rollout, batched by prompt.
 
-    uv run python sweep/capture_prefill.py runs/q35-4b-L22-full.jsonl runs/q35-4b-L13-r384.jsonl ...
+    uv run python sweep/capture_prefill.py runs/g3-4b-L17-full.jsonl runs/g3-4b-L11-r384.jsonl ...
 
 Writes captures/<run>.mlp_in.npy, float16 [rows, capture layers, hidden], row i = line i of the jsonl, and
-captures/<run>.mlp_in.json with the capture layers. Neuron activations follow as silu(x @ W_gate.T) * (x @ W_up.T).
+captures/<run>.mlp_in.json with the capture layers. Neuron activations follow as gelu(x @ W_gate.T) * (x @ W_up.T).
+The push is added where the sweep adds it: after post_feedforward_layernorm, along the write column.
 """
 import argparse
 import json
@@ -14,7 +15,9 @@ import time
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer
+
+from model_spec import MODEL, load, write_cols
 
 
 class Stop(Exception):
@@ -24,7 +27,7 @@ class Stop(Exception):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=MODEL)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0, help="the sweep's --seed (random-control directions)")
     ap.add_argument("--out-dir", default="captures")
@@ -32,8 +35,7 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cuda").eval()
-    lm = model.model.language_model
+    _, lm = load(a.model, "cuda")
     state = {"push_layer": None, "vec": None, "caps": {}, "last": None}
 
     def push_hook(i):
@@ -51,7 +53,7 @@ def main():
         return hook
 
     for i, layer in enumerate(lm.layers):
-        layer.mlp.register_forward_hook(push_hook(i))
+        layer.post_feedforward_layernorm.register_forward_hook(push_hook(i))
         layer.mlp.register_forward_pre_hook(cap_hook(i))
 
     for run in a.runs:
@@ -62,7 +64,7 @@ def main():
         if os.path.exists(out_path):
             print(f"{name}: exists, skipping", flush=True)
             continue
-        w_down = lm.layers[layer].mlp.down_proj.weight.detach().T.float().cpu().numpy()  # [N, hidden]
+        w_down = write_cols(lm.layers[layer]).detach().T.float().cpu().numpy()  # write columns, [N, hidden]
         rows = [json.loads(l) for l in open(run)]
         n_ctrl = max([r["neuron"] for r in rows if r["kind"] == "random"], default=-1) + 1
         rng = np.random.default_rng(a.seed)
