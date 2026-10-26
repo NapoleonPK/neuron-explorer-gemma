@@ -3,7 +3,8 @@
     uv run python explorer/build_steer_index.py --stats stats/steer_lens
 
 Reads stats/steer_lens_L{l}.npz for every layer (all must exist) and writes explorer/cache/steer_index.npz:
-up[L, N, k], down[L, N, k] (int32 token ids), up_kl[L, N], down_kl[L, N] (float16).
+up[L, N, k], down[L, N, k] (int32 token ids), up_kl[L, N], down_kl[L, N] (float16), N the widest layer (narrower
+layers are padded with token 0 and KL 0).
 """
 import argparse
 import glob
@@ -22,8 +23,8 @@ L = max(paths) + 1
 missing = sorted(set(range(L)) - set(paths))
 assert not missing, f"steer lens missing for layers {missing}"
 z = [np.load(paths[l]) for l in range(L)]
-np.savez(a.out, up=np.stack([x["up_tok"] for x in z]).astype(np.int32),
-         down=np.stack([x["down_tok"] for x in z]).astype(np.int32),
-         up_kl=np.stack([x["up_kl"] for x in z]).astype(np.float16),
-         down_kl=np.stack([x["down_kl"] for x in z]).astype(np.float16))
+N = max(len(x["up_kl"]) for x in z)
+pad = lambda key, dt: np.stack([np.pad(x[key], [(0, N - len(x[key]))] + [(0, 0)] * (x[key].ndim - 1)) for x in z]).astype(dt)
+np.savez(a.out, up=pad("up_tok", np.int32), down=pad("down_tok", np.int32),
+         up_kl=pad("up_kl", np.float16), down_kl=pad("down_kl", np.float16))
 print(f"{L} layers -> {a.out}")

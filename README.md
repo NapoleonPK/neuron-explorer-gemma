@@ -1,8 +1,10 @@
-# neuron explorer — Gemma 4 E4B (and Gemma 3 4B)
+# neuron explorer — Gemma 4 E2B / E4B (and Gemma 3 4B)
 
 A port of [lyramakesmusic/neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer), a steering-first neuron
-explorer built for Qwen3.5-4B, to **Gemma 4 E4B** (`google/gemma-4-E4B-it`: 42 layers, 10,240 GeGLU MLP neurons per
-layer, hidden size 2560). **Gemma 3 4B** (`google/gemma-3-4b-it`: 34 layers, same MLP width) is supported too. Every MLP
+explorer built for Qwen3.5-4B, to **Gemma 4 E2B** (`google/gemma-4-E2B-it`: 35 layers, hidden size 1536, 6,144 GeGLU
+MLP neurons on layers 0-14 and 12,288 on layers 15-34, about 10 GB in bf16, so it runs on a 16 GB Mac). **Gemma 4 E4B**
+(`google/gemma-4-E4B-it`: 42 layers, 10,240 neurons per layer, hidden size 2560) and **Gemma 3 4B**
+(`google/gemma-3-4b-it`: 34 layers, 10,240 neurons) are supported too. Every MLP
 neuron in a layer is pushed up and down on a few prompts, every rollout is kept, and the explorer lays the results out
 over a 3D view of the model. All credit for the explorer, the method and the original findings goes to the original
 author; this fork only changes what the model switch requires.
@@ -15,8 +17,8 @@ author; this fork only changes what the model switch requires.
   tokenizers and chat templates; the Gemma 4 one has per-layer embeddings, KV sharing, wide global heads and
   non-trivial layer scalars): live steering (add and multiply, multi-turn), activation reads with pushes and head
   ablation, logprobs, logit lens, connections, cones, search, fires, layouts, the stats pass, the steer lens and every
-  server endpoint. Tensor names, shapes, norm weights and layer scalars were checked against the real Gemma 4 E4B
-  checkpoint's header.
+  server endpoint, plus a Gemma 4 variant with E2B's double-wide layers. Tensor names, shapes, norm weights and layer
+  scalars were checked against the real E4B and E2B checkpoints' headers.
 - **Not yet run on the real weights or through the vLLM sweep.** No caches or sweep runs ship yet: the Qwen caches
   were removed (they do not fit Gemma's shapes), so the map starts with no sweep data until you run the steps below.
 - The Qwen findings in `research_log.md`, `NOTES.md` and the methodology's examples are kept for reference; their
@@ -24,15 +26,17 @@ author; this fork only changes what the model switch requires.
 
 ## Choosing the model
 
-    export EXPLORER_MODEL=google/gemma-4-E4B-it     # default, not gated
+    export EXPLORER_MODEL=google/gemma-4-E2B-it     # default, not gated
+    export EXPLORER_MODEL=google/gemma-4-E4B-it     # not gated
     export EXPLORER_MODEL=google/gemma-3-4b-it      # gated: accept the license on Hugging Face and `hf auth login`
     export EXPLORER_MODEL=unsloth/gemma-3-4b-it     # an ungated copy of the Gemma 3 weights
 
-Every script reads it. Stats and runs are named after the model (`stats/gemma-4-e4b_L17.npz`, `runs/gemma-4-e4b-L17`),
-so the two models never mix; the caches in `explorer/cache/` belong to one model at a time.
+Every script reads it. Stats and runs are named after the model (`stats/gemma-4-e2b_L17.npz`, `runs/gemma-4-e2b-L17`),
+so models never mix; the caches in `explorer/cache/` belong to one model at a time.
 
-Memory: Gemma 4 E4B's checkpoint is 16 GB in bf16 (5.6 GB of it is the per-layer embedding table), so the live model
-wants a GPU with 24 GB or more, or a Mac with 32 GB or more. Gemma 3 4B needs about 9 GB. `EXPLORER_NO_MODEL=1` runs the
+Memory: Gemma 4 E2B's text model is about 9.4 GB in bf16 (4.7 GB of it is the per-layer embedding table), which fits a
+16 GB Mac. E4B's is about 15 GB (16 GB checkpoint), so it wants a GPU with 24 GB or more, or a Mac with 32 GB or more.
+Gemma 3 4B needs about 9 GB. `EXPLORER_NO_MODEL=1` runs the
 explorer from caches only.
 
 ## What changed for Gemma
@@ -54,14 +58,19 @@ All the model specifics live in `sweep/model_spec.py`:
   real change in the neuron's activation.
 - **Logit lens, connections and layouts** use write columns; connections use Gemma's pre-MLP norm
   (`pre_feedforward_layernorm`).
-- **Attention**: every layer is softmax attention with 8 query heads; every 6th layer is global (5, 11, … 41 on
-  E4B; 5, 11, 17, 23, 29 on Gemma 3), the rest use a sliding window (512 tokens on E4B, 1024 on Gemma 3). E4B's global
-  heads are 512 wide and its last 18 layers reuse earlier layers' keys and values. The map draws global layers as the
-  thicker slabs.
+- **Attention**: every layer is softmax attention with 8 query heads. Some layers are global (4, 9, … 34 on E2B; 5, 11,
+  … 41 on E4B; 5, 11, 17, 23, 29 on Gemma 3), the rest use a sliding window (512 tokens on Gemma 4, 1024 on Gemma 3).
+  Gemma 4's global heads are 512 wide, and its last layers reuse earlier layers' keys and values (20 on E2B, 18 on
+  E4B). The map draws global layers as the thicker slabs.
 - **Chat and tokens**: each model's own chat template and end-of-turn token (`<turn|>` on Gemma 4, `<end_of_turn>` on
   Gemma 3), and `<bos>` at position 0 of every read and packed window (Gemma's residual stream blows up without it, and
   Gemma 4's tokenizer no longer adds it to plain text).
-- **Grid**: 10,240 neurons do not form a square, so each layer's sheet is 102 cells wide with a short last row.
+- **Layer widths**: E2B's KV-shared layers (15-34) have double-wide MLPs, 12,288 neurons against 6,144. Arrays over
+  every neuron of every layer (activations, lens and steer indexes, connections, layouts) are padded to the widest
+  layer; `mlp_widths()` in `sweep/model_spec.py` gives each layer's real width, the server masks the padding, and the
+  map leaves it out, so the narrower sheets fill only their top rows.
+- **Grid**: each sheet is ceil(sqrt(N)) cells wide for the widest layer's N (111 on E2B, 102 on E4B and Gemma 3), with a
+  short last row.
 - The vision and audio parts are dropped after loading; the explorer only reads text.
 - `explorer/build_steer_index.py` (new) stacks the per-layer steer lens files into `explorer/cache/steer_index.npz`.
 - Endpoints that need the connection index (cone, web) answer with an empty result and a note until
@@ -77,7 +86,7 @@ activation ranges (from FineWeb-Edu). The rest of the caches come from:
 
     uv run python explorer/build_connections.py        # direct-path links, CUDA or MPS
     uv run python explorer/build_layout.py --kind writes
-    uv run python sweep/steer_lens.py --layers 0-41 --out stats/steer_lens && \
+    uv run python sweep/steer_lens.py --out stats/steer_lens && \
         uv run python explorer/build_steer_index.py --stats stats/steer_lens
 
 - **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
@@ -98,14 +107,15 @@ activation ranges (from FineWeb-Edu). The rest of the caches come from:
 ## Sweep
 
 Runs on a CUDA GPU pod with the steering fork of vLLM ([RhizoNymph/vllm](https://github.com/RhizoNymph/vllm)), which
-wires the `mlp_in` / `mlp_out` hooks on Gemma 3 and Gemma 4. For E4B, a 40-80 GB card (A100, H100, L40S) leaves room
-for the 16 GB of weights plus a large batch of rollouts.
+wires the `mlp_in` / `mlp_out` hooks on Gemma 3 and Gemma 4. A 24-48 GB card is plenty for E2B; for E4B, a 40-80 GB
+card (A100, H100, L40S) leaves room for the 16 GB of weights plus a large batch of rollouts. `neuron_stats.py` and
+`steer_lens.py` also run on a Mac (MPS).
 
     bash sweep/setup_pod.sh                                   # fork, deps, model; writes /workspace/env.sh
     python sweep/neuron_stats.py --layers 17 --tokens 2000000
-    python sweep/check_equivalence.py --stats stats/gemma-4-e4b_L17.npz   # HF vs vLLM steering, before a full sweep
-    python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --neurons all --random-controls 256 --run gemma-4-e4b-L17
-    sweep/run_depth.sh "5 11 17 23 29 35" 384 64              # random-subset sweep across several layers
+    python sweep/check_equivalence.py --stats stats/gemma-4-e2b_L17.npz   # HF vs vLLM steering, before a full sweep
+    python sweep/steer_sweep.py --stats stats/gemma-4-e2b_L17.npz --neurons all --random-controls 256 --run gemma-4-e2b-L17
+    sweep/run_depth.sh "4 9 14 19 24 29 34" 384 64              # random-subset sweep across several layers
 
 `main_rel` doses are fractions of the median residual norm leaving the layer: {who, snake, orange} × {−0.7, +0.5, +0.8}
 and {free} × {+3}, plus one unsteered baseline per prompt. The coherent window was found on Qwen; check it on Gemma

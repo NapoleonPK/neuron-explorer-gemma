@@ -7,7 +7,7 @@
 2. Capture: neuron activations recomputed from a captured mlp_in, gelu(W_gate x) * (W_up x), match HF's activations
    at the same tokens (all prompt positions; capture positions must exist when a request is admitted).
 
-    uv run python sweep/check_equivalence.py --stats stats/gemma-4-e4b_L17.npz --neurons 2742,17,5000
+    uv run python sweep/check_equivalence.py --stats stats/gemma-4-e2b_L17.npz --neurons 2742,17,5000
 """
 import argparse
 import os

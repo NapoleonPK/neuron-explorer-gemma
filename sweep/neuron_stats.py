@@ -8,7 +8,7 @@ stream.
 
     uv run python sweep/neuron_stats.py --layers 17 --tokens 2000000
 
-Writes stats/gemma-4-e4b_L17.npz (the prefix follows the model) with
+Writes stats/gemma-4-e2b_L17.npz (the prefix follows the model) with
     pp_max, nn_max   largest positive activation in the (+,+) and (-,-) regimes          [I]
     pn_min, np_min   most negative activation in the (gate+, up-) and (gate-, up+) regimes [I]
     abs_max          max |activation| over everything (the unit for steering doses)      [I]
@@ -84,7 +84,7 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=f"stats/{TAG}")
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps")
     a = ap.parse_args()
     layers = [int(x) for x in a.layers.split(",")]
 

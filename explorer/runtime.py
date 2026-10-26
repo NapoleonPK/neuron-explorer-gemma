@@ -1,4 +1,4 @@
-"""Live Gemma model (Gemma 4 E4B by default, or Gemma 3) for the explorer: steered generation (add or multiply one
+"""Live Gemma model (Gemma 4 E2B by default, E4B, or Gemma 3) for the explorer: steered generation (add or multiply one
 neuron, per batch row), per-token neuron activations on arbitrary text, and logit-lens tokens for a neuron's write
 column.
 
@@ -7,6 +7,8 @@ Adding pushes along the neuron's write column after the post-feedforward norm (s
 place the sweep steers in vLLM (`mlp_out`). Add doses are in units of the median residual norm leaving the layer, the
 same unit as the sweep's `--dose-unit rel` (on Gemma 4, divided by the layer's output scalar, which multiplies the push
 afterwards).
+
+Captures over every neuron are padded with zeros to the widest layer (E2B's layers are 6144 or 12288 wide).
 """
 import json
 import os
@@ -20,8 +22,8 @@ import torch
 from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sweep"))
-from model_spec import (MODEL, TAG, chat_ids, end_ids, layer_scalar, load, norm_scale, pre_mlp_scale,  # noqa: E402
-                        text_ids, write_cols)
+from model_spec import (MODEL, TAG, chat_ids, end_ids, layer_scalar, load, mlp_widths, norm_scale,  # noqa: E402
+                        pre_mlp_scale, text_ids, write_cols)
 
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
@@ -72,6 +74,7 @@ class Runtime:
             self.tok = AutoTokenizer.from_pretrained(MODEL)
             m, lm = load(MODEL, dev)
             self.dev, self.model, self.lm = dev, m, lm
+            self.n_max = max(layer.mlp.down_proj.in_features for layer in lm.layers)
             self._ends = end_ids(self.tok)
             for i, layer in enumerate(self.lm.layers):
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
@@ -86,10 +89,11 @@ class Runtime:
     def _hook(self, i):
         def hook(mod, inp):
             h = inp[0]
+            pad = (0, self.n_max - h.shape[-1])  # narrower layers padded to the widest
             if self._capture_full is not None:
-                self._capture_full[i] = h[0].float().cpu()  # [tokens, inter]
+                self._capture_full[i] = torch.nn.functional.pad(h[0].float(), pad).cpu()  # [tokens, n_max]
             if self._capture_all is not None:
-                a = h[:, self._capture_from:].float().flatten(0, 1)  # [tokens, inter]
+                a = torch.nn.functional.pad(h[:, self._capture_from:].float().flatten(0, 1), pad)  # [tokens, n_max]
                 mx, amx = a.max(0)
                 mn, amn = a.min(0)
                 self._capture_all[i] = (mx.cpu(), amx.cpu(), mn.cpu(), amn.cpu())
@@ -454,20 +458,20 @@ class Runtime:
     # ---------- logit-lens index over every neuron ----------
     def build_lens_index(self, path, k=12, chunk=512):
         """Top-k tokens each neuron's write column pushes up and down, for every layer. Saved as int32 arrays
-        up[L, N, k], down[L, N, k]."""
+        up[L, N, k], down[L, N, k], N the widest layer (narrower layers' padding rows are 0)."""
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
+        L, N = len(self.lm.layers), self.n_max
         up = np.zeros((L, N, k), np.int32)
         down = np.zeros((L, N, k), np.int32)
         for li, layer in enumerate(self.lm.layers):
             self.status = f"indexing lens {li}/{L}"
             with self.lock, torch.inference_mode():
                 W = write_cols(layer)  # [hidden, inter]
-                for s in range(0, N, chunk):
+                for s in range(0, W.shape[1], chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
                     logits = self.model.lm_head(self.lm.norm(D))[:, 0]
-                    up[li, s:s + chunk] = logits.topk(k).indices.cpu().numpy()
-                    down[li, s:s + chunk] = (-logits).topk(k).indices.cpu().numpy()
+                    up[li, s:s + len(D)] = logits.topk(k).indices.cpu().numpy()
+                    down[li, s:s + len(D)] = (-logits).topk(k).indices.cpu().numpy()
         np.savez(path, up=up, down=down)
         self.status = "ready"
         return path
@@ -502,7 +506,7 @@ class Runtime:
         """Each neuron's largest positive and most negative activation over web text (positions >= 1)."""
         from datasets import load_dataset
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
+        L, N = len(self.lm.layers), self.n_max
         pos, neg = np.zeros((L, N), np.float32), np.zeros((L, N), np.float32)
         buf, seen = [], 0
         for d in load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True).shuffle(seed=seed):
@@ -521,7 +525,7 @@ class Runtime:
         return path
 
     def full_activations(self, ids):
-        """Every neuron's activation at every token: float32 array [layers, tokens, inter]."""
+        """Every neuron's activation at every token: float32 array [layers, tokens, n_max]."""
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
             self._capture_full = {}

@@ -1,7 +1,8 @@
-"""The model this explorer is built for, and the Gemma specifics every script shares. Gemma 4 E4B is the default;
-Gemma 3 4B works too.
+"""The model this explorer is built for, and the Gemma specifics every script shares. Gemma 4 E2B is the default (it
+fits a 16 GB Mac); Gemma 4 E4B and Gemma 3 4B work too.
 
-    EXPLORER_MODEL=google/gemma-4-E4B-it     # default
+    EXPLORER_MODEL=google/gemma-4-E2B-it     # default, ~10 GB in bf16
+    EXPLORER_MODEL=google/gemma-4-E4B-it     # ~16 GB
     EXPLORER_MODEL=google/gemma-3-4b-it      # gated; unsloth/gemma-3-4b-it is an ungated copy of the same weights
 
 Gemma normalises the MLP branch a second time before adding it to the residual stream (post_feedforward_layernorm).
@@ -14,6 +15,10 @@ gelu(gate) * up lives.
 Gemma 4 then multiplies each layer's whole output by a learned scalar (layer_scalar), after the per-layer input
 embedding step, so a push meant to move the residual leaving the layer by p is added as p / layer_scalar.
 
+E2B's MLPs are not all the same width: its KV-shared layers (15-34) are double wide, 12288 neurons against 6144
+(use_double_wide_mlp). Arrays over every neuron of every layer are padded to the widest layer; mlp_widths() says where
+each layer's real neurons end.
+
 Gemma needs <bos> at position 0: without it the residual stream blows up. Gemma 4's tokenizer no longer adds it to
 plain text, so text_ids() does, and every packed window starts with it.
 """
@@ -21,8 +26,17 @@ import json
 import os
 import re
 
-MODEL = os.environ.get("EXPLORER_MODEL", "google/gemma-4-E4B-it")
+MODEL = os.environ.get("EXPLORER_MODEL", "google/gemma-4-E2B-it")
 TAG = re.sub(r"-it$", "", re.sub(r"[^a-z0-9]+", "-", os.path.basename(MODEL.rstrip("/")).lower()))  # file prefix
+
+
+def mlp_widths(cfg):
+    """Neurons in each layer's MLP, from a text config (object or dict). Gemma 4 doubles the width of its KV-shared
+    layers when use_double_wide_mlp is set (E2B), as transformers' Gemma4TextMLP does."""
+    g = cfg.get if isinstance(cfg, dict) else lambda k: getattr(cfg, k, None)
+    L, n = g("num_hidden_layers"), g("intermediate_size")
+    first = L - (g("num_kv_shared_layers") or 0)
+    return [2 * n if g("use_double_wide_mlp") and l >= first > 0 else n for l in range(L)]
 
 
 def _plain_norm(norm):
@@ -106,6 +120,7 @@ class Checkpoint:
         key = next(k for k in self.index if k.endswith("layers.0.mlp.down_proj.weight")
                    and not any(s in k for s in ("vision", "audio")))
         self.prefix = key[: -len("0.mlp.down_proj.weight")]  # e.g. "model.language_model.layers."
+        self.widths = mlp_widths(self.cfg)
 
     def tensor(self, layer, name):
         from safetensors import safe_open

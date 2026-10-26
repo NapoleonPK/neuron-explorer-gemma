@@ -47,7 +47,9 @@ function glowPoints(sizePx, maxScale = 3) {
 }
 
 export function createMap(canvas, labelsDiv, arch, cb) {
-  const L = arch.n_layers, N = arch.inter;
+  // N is the widest layer; a narrower layer's slots n >= widths[l] are padding, drawn black (invisible under the
+  // additive blend) and never picked
+  const L = arch.n_layers, N = arch.inter, widths = arch.widths || Array(L).fill(N);
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setClearColor(PAL.bg);
@@ -83,7 +85,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   for (let l = 0; l < L; l++) for (let n = 0; n < N; n++) {
     const p = neuronPos(l, n), k = (l * N + n) * 3;
     pos[k] = p.x; pos[k + 1] = p.y; pos[k + 2] = p.z;
-    PAL.idle.toArray(col, k);
+    if (n < widths[l]) PAL.idle.toArray(col, k);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
@@ -327,7 +329,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     ray.setFromCamera(mouse, camera);
     // hits come sorted by depth; on a sheet seen at an angle several neighbours fall within the threshold, so take
     // the frontmost layer's hits and pick the point closest to the ray
-    const hits = ray.intersectObject(points);
+    const hits = ray.intersectObject(points).filter(h => h.index % N < widths[Math.floor(h.index / N)]);
     if (hits.length) {
       // the frontmost layer that is actually visible at the current fade, then the point closest to the ray in it
       const layers = [...new Set(hits.map(h => Math.floor(h.index / N)))];
@@ -463,7 +465,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     neuronPos,
     // the swept neurons' colours show on one layer at a time (the current one); the others go back to idle
     setUnits(layer, units) {
-      if (unitsLayer !== null && unitsLayer !== layer) for (let n = 0; n < N; n++) PAL.idle.toArray(col, (unitsLayer * N + n) * 3);
+      if (unitsLayer !== null && unitsLayer !== layer) for (let n = 0; n < widths[unitsLayer]; n++) PAL.idle.toArray(col, (unitsLayer * N + n) * 3);
       unitsLayer = layer;
       dataLayers.add(layer);
       labels[layer].material.userData.base = 1; labels[layer].material.color.set(0xffffff);

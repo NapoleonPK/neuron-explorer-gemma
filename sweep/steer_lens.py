@@ -6,7 +6,7 @@ Keeps, per neuron and sign, the 12 tokens whose log-probability rises most (aver
 divergence from the unsteered prediction.
 
     uv run python sweep/steer_lens.py --layers 0-7 --out stats/steer_lens
-    uv run python sweep/steer_lens.py --layers 0-41 --out stats/steer_lens   # all of Gemma 4 E4B
+    uv run python sweep/steer_lens.py --out stats/steer_lens                 # every layer
 
 Writes stats/steer_lens_L{l}.npz per layer: up_tok[N, 12], down_tok[N, 12] (token ids for the + push and - push),
 up_kl[N], down_kl[N].
@@ -28,19 +28,18 @@ PLAIN = ["I think the most important thing to remember is", "Today we are going 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--layers", default="0-41", help="Gemma 4 E4B has 42 layers, Gemma 3 4B 34")
+    ap.add_argument("--layers", default="", help="e.g. 0-7; default every layer (35 on E2B, 42 on E4B, 34 on Gemma 3)")
     ap.add_argument("--dose", type=float, default=0.8)
     ap.add_argument("--neurons-per-batch", type=int, default=96)
     ap.add_argument("--k", type=int, default=12)
     ap.add_argument("--out", default="stats/steer_lens")
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps")
     a = ap.parse_args()
-    lo, _, hi = a.layers.partition("-")
-    layers = list(range(int(lo), int(hi or lo) + 1))
-
     tok = AutoTokenizer.from_pretrained(a.model)
     dev = a.device
     model, lm = load(a.model, dev)
+    lo, _, hi = (a.layers or f"0-{len(lm.layers) - 1}").partition("-")
+    layers = list(range(int(lo), int(hi or lo) + 1))
     ctxs = [chat_ids(tok, [{"role": "user", "content": c}]) for c in CHAT] + [text_ids(tok, p) for p in PLAIN]
     C, T = len(ctxs), max(map(len, ctxs))
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
@@ -74,7 +73,7 @@ def main():
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     B = a.neurons_per_batch
     for l in layers:
-        W = write_cols(lm.layers[l]).float()  # [hidden, inter]
+        W = write_cols(lm.layers[l]).float()  # [hidden, this layer's width]
         N = W.shape[1]
         U = (W / W.norm(dim=0)).T  # [N, hidden] unit write columns
         out = {k: [] for k in ("up_tok", "down_tok", "up_kl", "down_kl")}

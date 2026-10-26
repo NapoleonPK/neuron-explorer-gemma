@@ -1,11 +1,13 @@
-"""Seriated sheet layouts: places each layer's neurons on its grid (ceil(sqrt(N)) cells wide: 102 for the 10240
-neurons of Gemma 4 E4B and Gemma 3 4B) so that neurons with similar weights sit together. Embeds each neuron by its write column ("writes": the
+"""Seriated sheet layouts: places each layer's neurons on its grid (ceil(sqrt(N)) cells wide, N the widest layer: 111
+for Gemma 4 E2B's 12288, 102 for the 10240 of E4B and Gemma 3 4B) so that neurons with similar weights sit together.
+A narrower layer fills the top rows of the grid. Embeds each neuron by its write column ("writes": the
 direction it adds to the residual stream) or its gate and up rows ("reads"), cosine-normalised, PCA to 50 dims, UMAP to
 2D, then snaps to the grid: sort by y into rows of the grid's width, then by x within each row.
 
     uv run python explorer/build_layout.py --kind writes
 
-Writes explorer/cache/layout_<kind>.npz: cell[L, N] (int16, row * 96 + col for neuron n of layer L).
+Writes explorer/cache/layout_<kind>.npz: cell[L, N] (int16, row * side + col for neuron n of layer L; a narrower
+layer's padding slots n >= its width keep cell n).
 """
 import argparse
 import os
@@ -25,10 +27,10 @@ ap.add_argument("--neighbors", type=int, default=30)
 a = ap.parse_args()
 
 ck = Checkpoint(a.model)
-L, N = ck.cfg["num_hidden_layers"], ck.cfg["intermediate_size"]
+L, N = len(ck.widths), max(ck.widths)
 side = int(np.ceil(N ** 0.5))  # grid width; the last row may be short (map3d.js uses the same width)
 
-cells = np.zeros((L, N), np.int16)
+cells = np.tile(np.arange(N, dtype=np.int16), (L, 1))
 for l in range(L):
     if a.kind == "writes":
         X = ck.write_cols(l).T.numpy()  # [N, hidden]
@@ -40,7 +42,7 @@ for l in range(L):
     Z = U[:, : a.pca] * S[: a.pca]
     xy = umap.UMAP(n_neighbors=a.neighbors, min_dist=0.05, metric="cosine", random_state=0).fit_transform(Z)
     by_y = np.argsort(xy[:, 1], kind="stable")
-    for r in range(-(-N // side)):
+    for r in range(-(-len(X) // side)):
         band = by_y[r * side:(r + 1) * side]
         band = band[np.argsort(xy[band, 0], kind="stable")]
         cells[l, band] = r * side + np.arange(len(band))

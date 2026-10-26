@@ -24,9 +24,9 @@ Each rollout keeps:
     recoverable from these as gelu(W_gate x) * (W_up x). Activations at generated tokens come from replaying
     the saved token ids through the model with the same steering, one teacher-forced forward pass.
 
-    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --design main_rel --dose-unit rel --neurons 2742 --run smoke-2742
-    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --design calib --dose-unit rel --neurons random:128 --random-controls 64 --run calib-L17
-    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e4b_L17.npz --design main_rel --dose-unit rel --neurons all --run gemma-4-e4b-L17
+    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e2b_L17.npz --design main_rel --dose-unit rel --neurons 2742 --run smoke-2742
+    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e2b_L17.npz --design calib --dose-unit rel --neurons random:128 --random-controls 64 --run calib-L17
+    uv run python sweep/steer_sweep.py --stats stats/gemma-4-e2b_L17.npz --design main_rel --dose-unit rel --neurons all --run gemma-4-e2b-L17
 
 Rerunning the same command resumes: rollouts already in the jsonl are skipped.
 """

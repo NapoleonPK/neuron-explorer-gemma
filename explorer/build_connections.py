@@ -8,7 +8,7 @@ its k strongest links per side across all layers, with sign(P).
     uv run python explorer/build_connections.py            # CUDA, about 5 min on a 4090
 
 Writes explorer/cache/connections.npz: {down,up}_layer [L, N, k] int8, {down,up}_n int16, {down,up}_z float16,
-{down,up}_sign int8.
+{down,up}_sign int8, N the widest layer (a narrower layer's padding rows keep z = -60000, i.e. no links).
 """
 import argparse
 import os
@@ -29,7 +29,7 @@ a = ap.parse_args()
 dev = "cuda" if torch.cuda.is_available() else "mps"
 
 ck = Checkpoint(a.model)
-L, N, K = ck.cfg["num_hidden_layers"], ck.cfg["intermediate_size"], a.k
+L, N, K = len(ck.widths), max(ck.widths), a.k
 bf = lambda t: t.to(dev, torch.bfloat16)
 down = [bf(ck.write_cols(l)) for l in range(L)]  # write columns, [hidden, N]
 gate = [bf(ck.tensor(l, "mlp.gate_proj.weight")) for l in range(L)]
@@ -44,12 +44,14 @@ best = {s: (torch.full((L, N, K), -1e9, device=dev), torch.zeros((L, N, K), dtyp
 
 def merge(side, l, z, idx, other_layer, sign):
     bz, bl, bn, bs = best[side]
-    cz = torch.cat([bz[l], z], 1)
-    cl = torch.cat([bl[l], torch.full_like(idx, other_layer, dtype=torch.int16)], 1)
-    cn = torch.cat([bn[l], idx.to(torch.int16)], 1)
-    cs = torch.cat([bs[l], sign], 1)
+    w = z.shape[0]  # layer l's width
+    cz = torch.cat([bz[l, :w], z], 1)
+    cl = torch.cat([bl[l, :w], torch.full_like(idx, other_layer, dtype=torch.int16)], 1)
+    cn = torch.cat([bn[l, :w], idx.to(torch.int16)], 1)
+    cs = torch.cat([bs[l, :w], sign], 1)
     top = cz.topk(K, dim=1)
-    bz[l], bl[l], bn[l], bs[l] = top.values, cl.gather(1, top.indices), cn.gather(1, top.indices), cs.gather(1, top.indices)
+    bz[l, :w], bl[l, :w], bn[l, :w], bs[l, :w] = (top.values, cl.gather(1, top.indices), cn.gather(1, top.indices),
+                                                  cs.gather(1, top.indices))
 
 
 t0 = time.time()

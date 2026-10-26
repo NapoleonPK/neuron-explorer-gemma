@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stats pass then a full-layer sweep for one layer. Logs to stats_L<layer>.log and sweep_<run>.log; detach with
-#     setsid nohup sweep/run_layer.sh 8 gemma-4-e4b-L8 </dev/null >/dev/null 2>&1 &
+#     setsid nohup sweep/run_layer.sh 8 gemma-4-e2b-L8 </dev/null >/dev/null 2>&1 &
 # Extra arguments pass through to steer_sweep.py.
 set -euo pipefail
 LAYER="$1"; RUN="$2"; shift 2

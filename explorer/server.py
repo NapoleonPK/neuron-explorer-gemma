@@ -21,16 +21,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import MODEL, NO_MODEL, Runtime, text_ids  # noqa: E402
+from runtime import MODEL, NO_MODEL, Runtime, mlp_widths, text_ids  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 NAMES = os.path.join(ROOT, "explorer", "names.json")
 PORT = int(os.environ.get("PORT", 8791))
 _cfg = AutoConfig.from_pretrained(MODEL).get_text_config()
 # Gemma 3 and 4: every layer is softmax attention, five sliding-window layers to each global ("full_attention") one
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
+_widths = mlp_widths(_cfg)  # neurons per layer; arrays over every neuron are padded to "inter", the widest
+ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": max(_widths), "widths": _widths,
         "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
         "kv_heads": _cfg.num_key_value_heads, "sliding_window": _cfg.sliding_window}
+REAL = np.arange(ARCH["inter"])[None, :] < np.array(_widths)[:, None]  # [L, N]: False on a narrower layer's padding
 
 app = FastAPI()
 
@@ -328,7 +330,7 @@ async def search(q: str, limit: int = 300):
 
 
 ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
-MAX_INFER_TOKENS = 1024  # [34, T, 10240] float32 activations plus scores: about 2.9 GB at this length
+MAX_INFER_TOKENS = 1024  # [35, T, 12288] float32 activations plus scores on E2B: about 3.5 GB at this length
 
 
 @app.get("/api/fires")
@@ -343,10 +345,11 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
     toks = [rt.tok.decode([t]) for t in ids]
     cand = []
     for l, (mx, amx, mn, amn) in acts.items():
-        p = mx.numpy() / np.maximum(sc["pos"][l], 1e-3)
-        q = mn.numpy() / np.minimum(sc["neg"][l], -1e-3)
+        w = ARCH["widths"][l]
+        p = mx.numpy()[:w] / np.maximum(sc["pos"][l, :w], 1e-3)
+        q = mn.numpy()[:w] / np.minimum(sc["neg"][l, :w], -1e-3)
         for arr, idx, sign, raw in ((p, amx.numpy(), "+", mx.numpy()), (q, amn.numpy(), "-", mn.numpy())):
-            top = np.argpartition(-arr, limit)[:limit]
+            top = np.argpartition(-arr, builtins.min(limit, arr.size - 1))[:limit]
             cand += [(float(arr[n]), l, int(n), sign, int(idx[n]), float(raw[n])) for n in top]
     cand.sort(reverse=True)
     idx_lens, nm = lens_index(), names()
@@ -410,7 +413,7 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
         at = S.argmax(1) if sign == "+" else S.argmin(1) if sign == "-" else np.abs(S).argmax(1)  # [L, N]
         best = np.take_along_axis(S, at[:, None, :], 1)[:, 0, :]
     view = best.copy()
-    keep = np.abs(best) >= min
+    keep = (np.abs(best) >= min) & REAL
     if sign == "+": keep &= best > 0
     if sign == "-": keep &= best < 0
     lay = np.arange(best.shape[0])[:, None]
@@ -446,7 +449,7 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     if "score" not in _infer or pos >= _infer["score"].shape[1]:
         return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
     S = _infer["score"][:, pos, :]  # [L, N]
-    flat = np.abs(S).ravel()
+    flat = np.where(REAL, np.abs(S), -1).ravel()
     cand = np.argpartition(-flat, min_k := builtins.min(top, flat.size - 1))[:min_k]
     cand = cand[flat[cand] >= min]
     N = S.shape[1]
@@ -658,6 +661,16 @@ def _live_off():
     return None
 
 
+def _bad_neuron(units):
+    """An error for the first (layer, n, ...) outside the model (layers differ in width on E2B), else None."""
+    for l, n, *_ in units:
+        if not 0 <= l < ARCH["n_layers"]:
+            return f"there is no layer {l} (0-{ARCH['n_layers'] - 1})"
+        if n is not None and not 0 <= n < ARCH["widths"][l]:
+            return f"layer {l} has {ARCH['widths'][l]} neurons (N0-N{ARCH['widths'][l] - 1})"
+    return None
+
+
 @app.post("/api/agent/steer")
 async def agent_steer(req: Request):
     """Steered rollouts for Claude: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
@@ -669,6 +682,8 @@ async def agent_steer(req: Request):
     dose, mode = float(b.get("dose", 0.8)), b.get("mode", "add")
     items = b.get("neurons") or [{"layer": b["layer"], "n": b["n"]}]
     pushes = [(int(x["layer"]), int(x["n"]), float(x.get("dose", dose)), x.get("mode", mode)) for x in items]
+    if err := _bad_neuron(pushes):
+        return {"error": err}
 
     def work():
         for row, delta in rt.steer_multi(pushes, [[{"role": "user", "content": b["prompt"]}]] * 3, int(b.get("max_new", 150))):
@@ -694,6 +709,8 @@ async def agent_activations(req: Request):
     pushes = [(int(p["layer"]), None if p.get("all") else int(p["n"]), float(p.get("dose", 0 if p.get("all") else 0.8)),
                "mul" if p.get("all") else p.get("mode", "add")) for p in items if "head" not in p]
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
+    if err := _bad_neuron(pushes + [(int(b["layer"]), int(b["n"]))]):
+        return {"error": err}
     for l, hd, _ in hs:
         if hd is not None and not 0 <= hd < rt.n_heads(l):
             return {"error": f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"}
@@ -712,6 +729,8 @@ def _interventions(b):
     pushes = [(int(p["layer"]), None if p.get("all") else int(p["n"]), float(p.get("dose", 0 if p.get("all") else 0.8)),
                "mul" if p.get("all") else p.get("mode", "add")) for p in items if "head" not in p]
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
+    if err := _bad_neuron(pushes):
+        return pushes, hs, err
     for l, hd, _ in hs:
         if hd is not None and not 0 <= hd < rt.n_heads(l):
             return pushes, hs, f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"
@@ -876,6 +895,18 @@ AGENT_METHOD = os.path.join(ROOT, "explorer", "agent_methodology.md")
 AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this machine's own additions, untracked
 
 
+def _inter_text():
+    """The MLP width for the agent prompt: one number, or the widths by layer range when they differ."""
+    w = ARCH["widths"]
+    if len(set(w)) == 1:
+        return str(w[0])
+    runs, start = [], 0
+    for l in range(1, len(w) + 1):
+        if l == len(w) or w[l] != w[start]:
+            runs.append(f"{w[start]} on layers {start}-{l - 1}"); start = l
+    return ", ".join(runs)
+
+
 def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
@@ -883,7 +914,7 @@ def agent_prompt_file():
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
             text = text.rstrip() + "\n\n" + open(extra).read()
-    fill = {"ROOT": ROOT, "MODEL": MODEL, "N_LAYERS": ARCH["n_layers"], "INTER": ARCH["inter"], "HIDDEN": ARCH["hidden"],
+    fill = {"ROOT": ROOT, "MODEL": MODEL, "N_LAYERS": ARCH["n_layers"], "INTER": _inter_text(), "HIDDEN": ARCH["hidden"],
             "HEADS": ARCH["attn_heads"], "WINDOW": ARCH["sliding_window"],
             "GLOBAL": ", ".join(str(i) for i, t in enumerate(ARCH["layer_types"]) if t == "full_attention"),
             "PLE_NOTE": "" if not getattr(_cfg, "hidden_size_per_layer_input", 0) else (
